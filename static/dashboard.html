@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Velocity Engine</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #fafafa;
+      color: #1a1a1a;
+      line-height: 1.5;
+      padding: 40px 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 48px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    
+    h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.5px; }
+    
+    .badge {
+      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-weight: 500;
+    }
+    
+    .badge.running { background: #e8f5e9; color: #2e7d32; }
+    .badge.stopped { background: #ffebee; color: #c62828; }
+    
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-bottom: 40px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px) { .grid, .grid-2 { grid-template-columns: 1fr; } }
+    
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    
+    .label {
+      font-size: 12px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    
+    .value {
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -1px;
+    }
+    
+    .sub { font-size: 13px; color: #888; margin-top: 4px; }
+    .green { color: #2e7d32; }
+    .red { color: #c62828; }
+    
+    .section { margin-bottom: 40px; }
+    .section-title { font-size: 14px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px; }
+    
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; font-size: 11px; font-weight: 500; color: #888; text-transform: uppercase; letter-spacing: 0.5px; padding: 12px 0; border-bottom: 1px solid #eee; }
+    td { padding: 14px 0; border-bottom: 1px solid #f5f5f5; font-size: 14px; }
+    .symbol { font-weight: 600; }
+    .mono { font-family: 'SF Mono', Monaco, monospace; font-size: 13px; }
+    
+    .empty { text-align: center; padding: 40px; color: #888; }
+    
+    .watchlist { display: flex; flex-wrap: wrap; gap: 8px; }
+    .tag { padding: 6px 14px; background: #f5f5f5; border-radius: 6px; font-size: 13px; font-weight: 500; }
+    
+    .bar { height: 6px; background: #eee; border-radius: 3px; margin-top: 12px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    
+    footer { margin-top: 48px; padding-top: 24px; border-top: 1px solid #e0e0e0; font-size: 12px; color: #888; display: flex; justify-content: space-between; }
+    
+    .loading { display: flex; align-items: center; justify-content: center; min-height: 60vh; font-size: 16px; color: #888; }
+  </style>
+</head>
+<body>
+  <div id="app"><div class="loading">Loading...</div></div>
+  
+  <script>
+    const API = window.location.origin;
+    
+    async function load() {
+      try {
+        const [status, vix, positions, signals, metrics, wl] = await Promise.all([
+          fetch(`${API}/api/status`).then(r => r.json()),
+          fetch(`${API}/api/vix`).then(r => r.json()),
+          fetch(`${API}/api/positions/live`).then(r => r.json()),
+          fetch(`${API}/api/signals?limit=8`).then(r => r.json()),
+          fetch(`${API}/api/metrics`).then(r => r.json()),
+          fetch(`${API}/api/watchlist`).then(r => r.json()),
+        ]);
+        render(status, vix, positions, signals, metrics, wl.symbols || []);
+      } catch (e) {
+        document.getElementById('app').innerHTML = '<div class="loading">Connection error</div>';
+      }
+    }
+    
+    function render(s, v, positions, signals, m, watchlist) {
+      const vixColor = v.value < 20 ? '#2e7d32' : v.value < 30 ? '#f57c00' : '#c62828';
+      
+      document.getElementById('app').innerHTML = `
+        <header>
+          <h1>Velocity Engine</h1>
+          <span class="badge ${s.state === 'running' ? 'running' : 'stopped'}">${s.state}</span>
+        </header>
+        
+        <div class="grid">
+          <div class="card">
+            <div class="label">Equity</div>
+            <div class="value">$${(s.equity || 0).toLocaleString()}</div>
+            <div class="sub">HWM: $${(s.high_water_mark || 0).toLocaleString()}</div>
+          </div>
+          
+          <div class="card">
+            <div class="label">Drawdown</div>
+            <div class="value ${s.current_drawdown > 10 ? 'red' : ''}">${(s.current_drawdown || 0).toFixed(2)}%</div>
+            <div class="sub">Shield: ${s.alpha_shield_triggered ? '⚠️ Triggered' : '✓ OK'}</div>
+          </div>
+          
+          <div class="card">
+            <div class="label">Positions</div>
+            <div class="value">${s.open_positions || 0}<span style="font-size:18px;color:#888">/${s.max_positions || 4}</span></div>
+            <div class="sub">Market: ${s.market_open ? 'Open' : 'Closed'}</div>
+          </div>
+          
+          <div class="card">
+            <div class="label">VIX</div>
+            <div class="value" style="color:${vixColor}">${(v.value || 0).toFixed(1)}</div>
+            <div class="sub">${v.regime} · ${(v.position_multiplier * 100).toFixed(0)}% sizing</div>
+            <div class="bar"><div class="bar-fill" style="width:${Math.min(v.value/50*100,100)}%;background:${vixColor}"></div></div>
+          </div>
+        </div>
+        
+        <div class="section">
+          <div class="section-title">Performance</div>
+          <div class="grid">
+            <div class="card">
+              <div class="label">Win Rate</div>
+              <div class="value ${m.win_rate >= 50 ? 'green' : 'red'}">${(m.win_rate || 0).toFixed(1)}%</div>
+            </div>
+            <div class="card">
+              <div class="label">Total P&L</div>
+              <div class="value ${m.total_pnl >= 0 ? 'green' : 'red'}">$${(m.total_pnl || 0).toFixed(0)}</div>
+            </div>
+            <div class="card">
+              <div class="label">Trades</div>
+              <div class="value">${m.total_trades || 0}</div>
+            </div>
+            <div class="card">
+              <div class="label">Profit Factor</div>
+              <div class="value ${m.profit_factor >= 1 ? 'green' : 'red'}">${(m.profit_factor || 0).toFixed(2)}</div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="section">
+          <div class="grid-2">
+            <div class="card">
+              <div class="label" style="margin-bottom:16px">Live Positions</div>
+              ${positions.length === 0 ? '<div class="empty">No open positions</div>' : `
+                <table>
+                  <tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th></tr>
+                  ${positions.map(p => `
+                    <tr>
+                      <td class="symbol">${p.symbol}</td>
+                      <td>${p.qty}</td>
+                      <td class="mono">$${p.avg_entry_price?.toFixed(2)}</td>
+                      <td class="mono">$${p.current_price?.toFixed(2)}</td>
+                      <td class="mono ${p.unrealized_pnl >= 0 ? 'green' : 'red'}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl?.toFixed(2)}</td>
+                    </tr>
+                  `).join('')}
+                </table>
+              `}
+            </div>
+            
+            <div class="card">
+              <div class="label" style="margin-bottom:16px">Recent Signals</div>
+              ${signals.length === 0 ? '<div class="empty">No signals yet</div>' : `
+                <table>
+                  <tr><th>Symbol</th><th>Type</th><th>Status</th><th>Price</th></tr>
+                  ${signals.map(x => `
+                    <tr>
+                      <td class="symbol">${x.symbol}</td>
+                      <td>${x.signal_type}</td>
+                      <td class="${x.status === 'EXECUTED' ? 'green' : ''}">${x.status}</td>
+                      <td class="mono">$${x.price_at_signal?.toFixed(2)}</td>
+                    </tr>
+                  `).join('')}
+                </table>
+              `}
+            </div>
+          </div>
+        </div>
+        
+        <div class="section">
+          <div class="card">
+            <div class="label" style="margin-bottom:12px">Watchlist</div>
+            <div class="watchlist">${watchlist.map(s => `<span class="tag">${s}</span>`).join('')}</div>
+          </div>
+        </div>
+        
+        <footer>
+          <span>Velocity Engine · ${s.mode}</span>
+          <span>Updated ${new Date().toLocaleTimeString()}</span>
+        </footer>
+      `;
+    }
+    
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>
