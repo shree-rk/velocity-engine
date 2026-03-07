@@ -1,0 +1,22 @@
+[Unit]
+Description=Velocity Engine Trading System
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=velocity
+Group=velocity
+WorkingDirectory=/home/velocity/velocity-engine
+Environment="PATH=/home/velocity/velocity-engine/venv/bin"
+EnvironmentFile=/home/velocity/velocity-engine/.env
+ExecStart=/home/velocity/velocity-engine/venv/bin/uvicorn api.server:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/var/log/velocity-engine/app.log
+StandardError=append:/var/log/velocity-engine/error.log
+
+[Install]
+WantedBy=multi-user.target
