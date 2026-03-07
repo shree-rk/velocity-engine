@@ -143,7 +143,7 @@ git commit -m "Phase 1 Batch 1: Project structure, config, indicators, tests"
 # Make it PRIVATE (important - your trading logic!)
 
 # Connect to GitHub (replace with your repo URL)
-git remote add origin https://github.com/YOUR_USERNAME/velocity-engine.git
+git remote add origin https://github.com/shree-rk/velocity-engine.git
 
 # Push
 git branch -M main

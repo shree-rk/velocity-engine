@@ -1,414 +1,341 @@
 """
-Velocity Engine - Indicator Unit Tests
-Validates all technical indicator calculations.
-Run: pytest tests/test_indicators.py -v
+Tests for Technical Indicators Module
+Run with: pytest tests/test_indicators.py -v
 """
 
 import pytest
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
+
 from indicators.technical import (
-    calculate_all_indicators,
-    calculate_stop_loss,
-    calculate_position_size,
-    validate_dataframe,
     IndicatorSnapshot,
+    calculate_sma,
+    calculate_bollinger_bands,
+    calculate_rsi,
+    calculate_atr,
+    calculate_adx,
+    calculate_volume_ratio,
+    calculate_all_indicators,
+    calculate_indicators
 )
 
 
-def make_test_df(rows: int = 100, base_price: float = 100.0, volatility: float = 2.0) -> pd.DataFrame:
-    """
-    Generate a realistic OHLCV DataFrame for testing.
-    Creates a mean-reverting price series with volume spikes.
-    """
-    np.random.seed(42)  # Reproducible results
-    dates = pd.date_range("2026-01-01 09:30", periods=rows, freq="15min")
+# ============================================================================
+# Test Fixtures
+# ============================================================================
 
-    # Generate price series with some mean reversion
-    returns = np.random.normal(0, volatility / 100, rows)
-    prices = base_price * np.exp(np.cumsum(returns))
-
-    # Add realistic OHLC variation
-    opens = prices * (1 + np.random.uniform(-0.002, 0.002, rows))
-    highs = np.maximum(opens, prices) * (1 + np.abs(np.random.normal(0, 0.003, rows)))
-    lows = np.minimum(opens, prices) * (1 - np.abs(np.random.normal(0, 0.003, rows)))
-    closes = prices
-
-    # Volume with occasional spikes
-    base_volume = 1000000
-    volumes = np.random.lognormal(np.log(base_volume), 0.5, rows).astype(int)
-
-    df = pd.DataFrame({
-        "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": closes,
-        "volume": volumes,
-    }, index=dates)
-
-    return df
-
-
-def make_oversold_df() -> pd.DataFrame:
-    """
-    Generate a DataFrame where the last bar is clearly oversold.
-    Sharp drop at the end to trigger entry conditions.
-    """
+@pytest.fixture
+def sample_ohlcv_df():
+    """Create sample OHLCV DataFrame for testing."""
     np.random.seed(42)
-    rows = 100
-    dates = pd.date_range("2026-01-01 09:30", periods=rows, freq="15min")
-
-    # Start with stable price, then sharp drop in last 5 bars
-    prices = np.full(rows, 100.0)
-    prices[:80] = 100 + np.random.normal(0, 0.5, 80)  # Stable around 100
-
-    # Sharp drop in last 20 bars
-    for i in range(80, rows):
-        prices[i] = prices[i-1] - np.random.uniform(0.3, 0.8)
-
-    opens = prices + np.random.uniform(-0.1, 0.1, rows)
-    highs = np.maximum(opens, prices) + np.abs(np.random.normal(0, 0.2, rows))
-    lows = np.minimum(opens, prices) - np.abs(np.random.normal(0, 0.2, rows))
-
-    # High volume on last bar (capitulation)
-    volumes = np.full(rows, 1000000)
-    volumes[-1] = 3000000  # 3x spike on last bar
-
+    n = 50  # Need enough data for indicators
+    
+    dates = pd.date_range(end=datetime.now(), periods=n, freq='15min')
+    
+    # Generate realistic price data
+    base_price = 100.0
+    returns = np.random.randn(n) * 0.02  # 2% volatility
+    prices = base_price * np.exp(np.cumsum(returns))
+    
     df = pd.DataFrame({
-        "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": prices,
-        "volume": volumes,
+        'open': prices * (1 + np.random.randn(n) * 0.005),
+        'high': prices * (1 + np.abs(np.random.randn(n) * 0.01)),
+        'low': prices * (1 - np.abs(np.random.randn(n) * 0.01)),
+        'close': prices,
+        'volume': np.random.randint(1000000, 5000000, n)
     }, index=dates)
-
+    
     return df
 
 
-# ============================================================
-# DataFrame Validation Tests
-# ============================================================
-
-class TestValidation:
-    def test_valid_dataframe_passes(self):
-        df = make_test_df()
-        assert validate_dataframe(df) is True
-
-    def test_missing_column_raises(self):
-        df = make_test_df()
-        df = df.drop(columns=["volume"])
-        with pytest.raises(ValueError, match="missing columns"):
-            validate_dataframe(df)
-
-    def test_insufficient_rows_raises(self):
-        df = make_test_df(rows=10)
-        with pytest.raises(ValueError, match="at least 50 rows"):
-            validate_dataframe(df)
-
-    def test_nan_values_raise(self):
-        df = make_test_df()
-        df.loc[df.index[50], "close"] = np.nan
-        with pytest.raises(ValueError, match="NaN"):
-            validate_dataframe(df)
+@pytest.fixture
+def oversold_df():
+    """Create DataFrame with oversold conditions."""
+    n = 50
+    dates = pd.date_range(end=datetime.now(), periods=n, freq='15min')
+    
+    # Create declining prices to trigger oversold RSI
+    prices = np.linspace(120, 95, n)  # Steady decline
+    
+    df = pd.DataFrame({
+        'open': prices + 0.5,
+        'high': prices + 1,
+        'low': prices - 1,
+        'close': prices,
+        'volume': [3000000] * n  # High volume
+    }, index=dates)
+    
+    return df
 
 
-# ============================================================
-# Indicator Calculation Tests
-# ============================================================
+# ============================================================================
+# IndicatorSnapshot Tests
+# ============================================================================
 
-class TestIndicatorCalculation:
-    def test_calculate_all_returns_snapshot(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "NVDA")
-        assert isinstance(snap, IndicatorSnapshot)
-        assert snap.symbol == "NVDA"
+class TestIndicatorSnapshot:
+    """Tests for IndicatorSnapshot dataclass."""
+    
+    def test_snapshot_creation(self):
+        """Snapshot can be created with all required fields."""
+        snap = IndicatorSnapshot(
+            symbol="TEST",
+            price=100.0,
+            sma_20=102.0,
+            bb_upper=110.0,
+            bb_lower=94.0,
+            rsi_14=45.0,
+            atr_14=2.5,
+            adx_14=25.0,
+            plus_di=20.0,
+            minus_di=15.0,
+            volume=2000000,
+            avg_volume=1500000,
+            volume_ratio=1.33
+        )
+        
+        assert snap.symbol == "TEST"
+        assert snap.price == 100.0
+        assert snap.rsi_14 == 45.0
+    
+    def test_is_oversold(self):
+        """is_oversold property works correctly."""
+        oversold = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=105, bb_upper=110, bb_lower=95,
+            rsi_14=25.0, atr_14=2, adx_14=25, plus_di=15, minus_di=20,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.33
+        )
+        
+        not_oversold = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=105, bb_upper=110, bb_lower=95,
+            rsi_14=55.0, atr_14=2, adx_14=25, plus_di=15, minus_di=20,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.33
+        )
+        
+        assert oversold.is_oversold is True
+        assert not_oversold.is_oversold is False
+    
+    def test_is_overbought(self):
+        """is_overbought property works correctly."""
+        overbought = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=105, bb_upper=110, bb_lower=95,
+            rsi_14=75.0, atr_14=2, adx_14=25, plus_di=25, minus_di=15,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.33
+        )
+        
+        assert overbought.is_overbought is True
+    
+    def test_is_below_lower_band(self):
+        """is_below_lower_band property works correctly."""
+        below = IndicatorSnapshot(
+            symbol="TEST", price=93.0, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=28, atr_14=2, adx_14=25, plus_di=15, minus_di=25,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.5
+        )
+        
+        above = IndicatorSnapshot(
+            symbol="TEST", price=100.0, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=50, atr_14=2, adx_14=25, plus_di=20, minus_di=20,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.0
+        )
+        
+        assert below.is_below_lower_band is True
+        assert above.is_below_lower_band is False
+    
+    def test_is_trending(self):
+        """is_trending property works correctly."""
+        trending = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=50, atr_14=2, adx_14=28.0, plus_di=20, minus_di=15,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.0
+        )
+        
+        ranging = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=50, atr_14=2, adx_14=15.0, plus_di=18, minus_di=17,
+            volume=2000000, avg_volume=1500000, volume_ratio=1.0
+        )
+        
+        assert trending.is_trending is True
+        assert ranging.is_trending is False
+    
+    def test_has_volume_confirmation(self):
+        """has_volume_confirmation property works correctly."""
+        high_vol = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=50, atr_14=2, adx_14=25, plus_di=20, minus_di=15,
+            volume=3000000, avg_volume=1500000, volume_ratio=2.0
+        )
+        
+        low_vol = IndicatorSnapshot(
+            symbol="TEST", price=100, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=50, atr_14=2, adx_14=25, plus_di=20, minus_di=15,
+            volume=1200000, avg_volume=1500000, volume_ratio=0.8
+        )
+        
+        assert high_vol.has_volume_confirmation is True
+        assert low_vol.has_volume_confirmation is False
+    
+    def test_conditions_met_count(self):
+        """conditions_met_count counts correctly."""
+        # All 4 conditions met
+        all_met = IndicatorSnapshot(
+            symbol="TEST", price=93.0, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=25.0, atr_14=2, adx_14=25.0, plus_di=15, minus_di=25,
+            volume=3000000, avg_volume=1500000, volume_ratio=2.0
+        )
+        
+        assert all_met.conditions_met_count == 4
+        assert all_met.all_entry_conditions_met is True
+        
+        # Only 2 conditions met (RSI oversold, ADX trending)
+        some_met = IndicatorSnapshot(
+            symbol="TEST", price=100.0, sma_20=100, bb_upper=106, bb_lower=94,
+            rsi_14=25.0, atr_14=2, adx_14=25.0, plus_di=20, minus_di=15,
+            volume=1200000, avg_volume=1500000, volume_ratio=0.8
+        )
+        
+        assert some_met.conditions_met_count == 2
+        assert some_met.all_entry_conditions_met is False
 
-    def test_price_is_last_close(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "AAPL")
-        assert snap.price == pytest.approx(df["close"].iloc[-1], rel=1e-4)
 
-    def test_sma_is_reasonable(self):
-        df = make_test_df(base_price=100)
-        snap = calculate_all_indicators(df, "TEST")
-        # SMA should be roughly near the price (within 20% for test data)
-        assert 50 < snap.sma_20 < 200
+# ============================================================================
+# Individual Indicator Tests
+# ============================================================================
 
-    def test_bb_bands_bracket_sma(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        assert snap.bb_lower < snap.sma_20 < snap.bb_upper
+class TestIndividualIndicators:
+    """Tests for individual indicator calculations."""
+    
+    def test_calculate_sma(self, sample_ohlcv_df):
+        """SMA calculation works correctly."""
+        sma = calculate_sma(sample_ohlcv_df, period=20)
+        
+        assert len(sma) == len(sample_ohlcv_df)
+        assert pd.notna(sma.iloc[-1])
+        # First 19 values should be NaN (need 20 periods)
+        assert pd.isna(sma.iloc[0])
+    
+    def test_calculate_bollinger_bands(self, sample_ohlcv_df):
+        """Bollinger Bands calculation works correctly."""
+        lower, mid, upper = calculate_bollinger_bands(sample_ohlcv_df, 20, 2.0)
+        
+        assert len(lower) == len(sample_ohlcv_df)
+        # Upper should be above mid, mid above lower
+        last_idx = -1
+        if pd.notna(upper.iloc[last_idx]):
+            assert upper.iloc[last_idx] > mid.iloc[last_idx]
+            assert mid.iloc[last_idx] > lower.iloc[last_idx]
+    
+    def test_calculate_rsi(self, sample_ohlcv_df):
+        """RSI calculation works correctly."""
+        rsi = calculate_rsi(sample_ohlcv_df, period=14)
+        
+        assert len(rsi) == len(sample_ohlcv_df)
+        # RSI should be between 0 and 100
+        valid_rsi = rsi.dropna()
+        assert (valid_rsi >= 0).all()
+        assert (valid_rsi <= 100).all()
+    
+    def test_calculate_atr(self, sample_ohlcv_df):
+        """ATR calculation works correctly."""
+        atr = calculate_atr(sample_ohlcv_df, period=14)
+        
+        assert len(atr) == len(sample_ohlcv_df)
+        # ATR should be positive
+        valid_atr = atr.dropna()
+        assert (valid_atr > 0).all()
+    
+    def test_calculate_adx(self, sample_ohlcv_df):
+        """ADX calculation works correctly."""
+        adx, plus_di, minus_di = calculate_adx(sample_ohlcv_df, period=14)
+        
+        assert len(adx) == len(sample_ohlcv_df)
+        # ADX should be between 0 and 100
+        valid_adx = adx.dropna()
+        assert (valid_adx >= 0).all()
+        assert (valid_adx <= 100).all()
+    
+    def test_calculate_volume_ratio(self, sample_ohlcv_df):
+        """Volume ratio calculation works correctly."""
+        vol_ratio = calculate_volume_ratio(sample_ohlcv_df, period=20)
+        
+        assert len(vol_ratio) == len(sample_ohlcv_df)
+        # Volume ratio should be positive
+        valid_ratio = vol_ratio.dropna()
+        assert (valid_ratio > 0).all()
 
-    def test_rsi_in_valid_range(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        assert 0 <= snap.rsi_14 <= 100
 
-    def test_atr_is_positive(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        assert snap.atr_14 > 0
+# ============================================================================
+# Combined Indicator Tests
+# ============================================================================
 
-    def test_adx_in_valid_range(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        assert 0 <= snap.adx_14 <= 100
-
-    def test_volume_ratio_calculated(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        assert snap.volume_ratio > 0
-        assert snap.avg_volume > 0
-        assert snap.volume > 0
-
-    def test_to_dict_has_all_fields(self):
-        df = make_test_df()
-        snap = calculate_all_indicators(df, "TEST")
-        d = snap.to_dict()
-        required_keys = [
-            "symbol", "price", "sma_20", "bb_upper", "bb_lower",
-            "rsi_14", "atr_14", "adx_14", "volume", "avg_volume",
-            "volume_ratio", "below_bb", "oversold", "not_trending",
-            "vol_spike", "all_met"
+class TestCombinedIndicators:
+    """Tests for combined indicator functions."""
+    
+    def test_calculate_all_indicators(self, sample_ohlcv_df):
+        """calculate_all_indicators adds all columns."""
+        result = calculate_all_indicators(sample_ohlcv_df)
+        
+        expected_columns = [
+            'sma_20', 'bb_lower', 'bb_mid', 'bb_upper',
+            'rsi_14', 'atr_14', 'adx_14', 'plus_di', 'minus_di',
+            'avg_volume', 'volume_ratio'
         ]
-        for key in required_keys:
-            assert key in d, f"Missing key: {key}"
+        
+        for col in expected_columns:
+            assert col in result.columns, f"Missing column: {col}"
+    
+    def test_calculate_indicators_returns_snapshot(self, sample_ohlcv_df):
+        """calculate_indicators returns IndicatorSnapshot."""
+        snapshot = calculate_indicators(sample_ohlcv_df, "TEST")
+        
+        assert snapshot is not None
+        assert isinstance(snapshot, IndicatorSnapshot)
+        assert snapshot.symbol == "TEST"
+        assert snapshot.price > 0
+    
+    def test_calculate_indicators_with_short_df(self):
+        """calculate_indicators returns None for insufficient data."""
+        short_df = pd.DataFrame({
+            'open': [100, 101],
+            'high': [102, 103],
+            'low': [99, 100],
+            'close': [101, 102],
+            'volume': [1000000, 1100000]
+        })
+        
+        result = calculate_indicators(short_df, "TEST")
+        assert result is None
+    
+    def test_calculate_indicators_with_none(self):
+        """calculate_indicators returns None for None input."""
+        result = calculate_indicators(None, "TEST")
+        assert result is None
 
 
-# ============================================================
-# Entry Condition Logic Tests
-# ============================================================
+# ============================================================================
+# Integration Tests
+# ============================================================================
 
-class TestEntryConditions:
-    def test_below_bb_detection(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.is_below_lower_bb is True
-
-    def test_above_bb_not_triggered(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=98.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.is_below_lower_bb is False
-
-    def test_oversold_detection(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.is_oversold is True
-
-    def test_not_oversold(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=45.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.is_oversold is False
-
-    def test_trend_blocked_when_adx_high(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=35.0,  # Strong trend
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.is_not_trending is False
-
-    def test_volume_spike_detection(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.has_volume_spike is True
-
-    def test_no_volume_spike(self):
-        snap = IndicatorSnapshot(
-            symbol="TEST", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=800000, avg_volume=1000000, volume_ratio=0.8,
-        )
-        assert snap.has_volume_spike is False
-
-    def test_all_conditions_met(self):
-        """Perfect entry: below BB, RSI<30, ADX<30, volume spike."""
-        snap = IndicatorSnapshot(
-            symbol="NVDA", price=95.0,
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0, atr_14=2.0, adx_14=20.0,
-            plus_di=15.0, minus_di=25.0,
-            volume=2000000, avg_volume=1000000, volume_ratio=2.0,
-        )
-        assert snap.all_entry_conditions_met is True
-        assert snap.conditions_met_count == 4
-
-    def test_partial_conditions(self):
-        """Only 2 of 4 conditions met = WATCHING."""
-        snap = IndicatorSnapshot(
-            symbol="NVDA", price=95.0,      # Below BB ✓
-            sma_20=100.0, bb_upper=105.0, bb_lower=96.0,
-            rsi_14=25.0,                     # Oversold ✓
-            atr_14=2.0, adx_14=35.0,        # Trending ✗
-            plus_di=15.0, minus_di=25.0,
-            volume=800000, avg_volume=1000000, volume_ratio=0.8,  # No spike ✗
-        )
-        assert snap.all_entry_conditions_met is False
-        assert snap.conditions_met_count == 2
-
-
-# ============================================================
-# Stop Loss Tests
-# ============================================================
-
-class TestStopLoss:
-    def test_high_beta_stop(self):
-        """HIGH_BETA: 1.5x ATR stop."""
-        stop = calculate_stop_loss(entry_price=200.0, atr=3.0, atr_multiplier=1.5)
-        assert stop == pytest.approx(195.5)  # 200 - (3 * 1.5) = 195.5
-
-    def test_moderate_stop(self):
-        """MODERATE: 2x ATR stop."""
-        stop = calculate_stop_loss(entry_price=150.0, atr=2.0, atr_multiplier=2.0)
-        assert stop == pytest.approx(146.0)  # 150 - (2 * 2) = 146
-
-    def test_etf_stop(self):
-        """ETF: 2x ATR stop."""
-        stop = calculate_stop_loss(entry_price=450.0, atr=5.0, atr_multiplier=2.0)
-        assert stop == pytest.approx(440.0)  # 450 - (5 * 2) = 440
-
-    def test_stop_below_entry(self):
-        """Stop loss should always be below entry price."""
-        stop = calculate_stop_loss(entry_price=100.0, atr=1.0, atr_multiplier=2.0)
-        assert stop < 100.0
-
-
-# ============================================================
-# Position Sizing Tests
-# ============================================================
-
-class TestPositionSizing:
-    def test_basic_position_size(self):
-        """Standard 2% risk calculation."""
-        shares = calculate_position_size(
-            equity=100000,
-            entry_price=100.0,
-            stop_loss_price=95.0,  # $5 stop distance
-            risk_pct=0.02,
-            max_position_pct=0.25,
-        )
-        # Risk = $2000, stop distance = $5, shares by risk = 400
-        # Cap = $25000 / $100 = 250 shares
-        # Min(400, 250) = 250
-        assert shares == 250
-
-    def test_risk_limited(self):
-        """When risk-based is smaller than cap-based."""
-        shares = calculate_position_size(
-            equity=100000,
-            entry_price=10.0,
-            stop_loss_price=9.0,  # $1 stop distance
-            risk_pct=0.02,
-            max_position_pct=0.25,
-        )
-        # Risk = $2000, stop = $1, shares by risk = 2000
-        # Cap = $25000 / $10 = 2500
-        # Min(2000, 2500) = 2000
-        assert shares == 2000
-
-    def test_vix_multiplier_reduces_size(self):
-        """VIX ELEVATED (50% size)."""
-        shares_normal = calculate_position_size(
-            equity=100000, entry_price=100.0, stop_loss_price=98.0,
-            vix_multiplier=1.0,
-            max_position_pct=1.0,  # no cap limit for this test
-        )
-        shares_elevated = calculate_position_size(
-            equity=100000, entry_price=100.0, stop_loss_price=98.0,
-            vix_multiplier=0.5,
-            max_position_pct=1.0,
-        )
-        assert shares_elevated < shares_normal
-        assert shares_elevated == pytest.approx(shares_normal * 0.5, abs=1)
-
-    def test_zero_stop_distance_returns_zero(self):
-        """Edge case: stop at entry should return 0 shares."""
-        shares = calculate_position_size(
-            equity=100000, entry_price=100.0, stop_loss_price=100.0,
-        )
-        assert shares == 0
-
-    def test_negative_stop_returns_zero(self):
-        """Edge case: stop above entry should return 0."""
-        shares = calculate_position_size(
-            equity=100000, entry_price=100.0, stop_loss_price=105.0,
-        )
-        assert shares == 0
-
-    def test_always_returns_integer(self):
-        """Position size must be a whole number of shares."""
-        shares = calculate_position_size(
-            equity=100000, entry_price=137.53, stop_loss_price=132.53,
-        )
-        assert isinstance(shares, int)
-
-    def test_extreme_vix_returns_zero(self):
-        """VIX EXTREME (0% multiplier) = no trade."""
-        shares = calculate_position_size(
-            equity=100000, entry_price=100.0, stop_loss_price=95.0,
-            vix_multiplier=0.0,
-        )
-        assert shares == 0
-
-
-# ============================================================
-# Integration-style: Full indicator pipeline on synthetic data
-# ============================================================
-
-class TestFullPipeline:
-    def test_normal_market_conditions(self):
-        """Standard market data should produce valid indicators."""
-        df = make_test_df(rows=100, base_price=150, volatility=1.5)
-        snap = calculate_all_indicators(df, "MSFT")
-
-        # All values should be finite and reasonable
-        assert 0 < snap.price < 1000
-        assert 0 < snap.sma_20 < 1000
-        assert snap.bb_lower < snap.sma_20 < snap.bb_upper
-        assert 0 <= snap.rsi_14 <= 100
-        assert snap.atr_14 > 0
-        assert 0 <= snap.adx_14 <= 100
-
-    def test_oversold_conditions_detected(self):
-        """Oversold synthetic data should trigger entry conditions."""
-        df = make_oversold_df()
-        snap = calculate_all_indicators(df, "AMD")
-
-        # After a sharp drop with volume spike, we expect:
-        # - Price below BB (likely)
-        # - RSI low (likely, but depends on drop severity)
-        # - Volume spike on last bar (we set this up)
-        assert snap.volume_ratio > 1.5  # We forced a 3x spike
-        # Note: RSI and BB depend on exact calculation - just verify they compute
+class TestIndicatorIntegration:
+    """Integration tests for the indicators module."""
+    
+    def test_oversold_detection(self, oversold_df):
+        """Can detect oversold conditions from real-ish data."""
+        snapshot = calculate_indicators(oversold_df, "OVERSOLD_TEST")
+        
+        assert snapshot is not None
+        # With declining prices, RSI should be low
+        assert snapshot.rsi_14 < 50  # At least below neutral
+    
+    def test_indicator_consistency(self, sample_ohlcv_df):
+        """Indicators are consistent across multiple calls."""
+        snap1 = calculate_indicators(sample_ohlcv_df, "TEST")
+        snap2 = calculate_indicators(sample_ohlcv_df, "TEST")
+        
+        assert snap1.price == snap2.price
+        assert snap1.rsi_14 == snap2.rsi_14
+        assert snap1.adx_14 == snap2.adx_14
 
 
 if __name__ == "__main__":

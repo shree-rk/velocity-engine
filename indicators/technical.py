@@ -1,297 +1,283 @@
 """
-Velocity Engine - Technical Indicators
-Calculates all indicators used by Velocity 2.0 strategy.
-Uses pandas-ta for battle-tested implementations.
+Technical Indicators Module
+Calculates all indicators needed for the Velocity Mean Reversion strategy.
 
-All functions take a pandas DataFrame with columns: open, high, low, close, volume
-and return the indicator values for the LATEST bar.
+Indicators:
+- SMA (20-period)
+- Bollinger Bands (20-period, 2 std dev)
+- RSI (14-period)
+- ATR (14-period)
+- ADX with +DI/-DI (14-period)
+- Volume ratio (current vs 20-period average)
 """
 
-import pandas as pd
-import pandas_ta as ta
-import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
-from config.settings import (
-    BB_PERIOD, BB_STD_DEV, RSI_PERIOD, ATR_PERIOD,
-    ADX_PERIOD, SMA_PERIOD, VOLUME_AVG_PERIOD
-)
+import pandas as pd
+import pandas_ta as ta
 
 
 @dataclass
 class IndicatorSnapshot:
-    """All indicator values for a single symbol at a point in time."""
+    """
+    Point-in-time snapshot of all indicator values for a symbol.
+    
+    This is what gets passed to the strategy for signal generation.
+    """
+    # Required fields (no defaults) - must come first
     symbol: str
     price: float
+    
+    # Moving Averages
     sma_20: float
+    
+    # Bollinger Bands
     bb_upper: float
     bb_lower: float
+    
+    # Momentum
     rsi_14: float
+    
+    # Volatility
     atr_14: float
+    
+    # Trend Strength
     adx_14: float
     plus_di: float
     minus_di: float
+    
+    # Volume
     volume: float
     avg_volume: float
     volume_ratio: float
-    timestamp: Optional[pd.Timestamp] = None
-
-    @property
-    def is_below_lower_bb(self) -> bool:
-        """Price is below Lower Bollinger Band."""
-        return self.price < self.bb_lower
-
+    
+    # Optional fields (with defaults) - must come last
+    bb_mid: float = 0.0  # Same as SMA-20
+    
     @property
     def is_oversold(self) -> bool:
-        """RSI indicates oversold condition."""
+        """Check if RSI indicates oversold condition."""
         return self.rsi_14 < 30
-
+    
     @property
-    def is_not_trending(self) -> bool:
-        """ADX indicates no strong trend (safe for mean reversion)."""
-        return self.adx_14 < 30
-
+    def is_overbought(self) -> bool:
+        """Check if RSI indicates overbought condition."""
+        return self.rsi_14 > 70
+    
     @property
-    def has_volume_spike(self) -> bool:
-        """Volume is >= 1.5x the 20-period average."""
+    def is_below_lower_band(self) -> bool:
+        """Check if price is at or below lower Bollinger Band."""
+        return self.price <= self.bb_lower
+    
+    @property
+    def is_trending(self) -> bool:
+        """Check if ADX indicates a trend (> 20)."""
+        return self.adx_14 > 20
+    
+    @property
+    def has_volume_confirmation(self) -> bool:
+        """Check if volume is above average (1.5x)."""
         return self.volume_ratio >= 1.5
-
-    @property
-    def all_entry_conditions_met(self) -> bool:
-        """All 4 technical entry conditions for Velocity 2.0."""
-        return (
-            self.is_below_lower_bb
-            and self.is_oversold
-            and self.is_not_trending
-            and self.has_volume_spike
-        )
-
+    
     @property
     def conditions_met_count(self) -> int:
-        """How many of the 4 entry conditions are met (for WATCHING status)."""
-        return sum([
-            self.is_below_lower_bb,
-            self.is_oversold,
-            self.is_not_trending,
-            self.has_volume_spike,
-        ])
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for logging/storage."""
-        return {
-            "symbol": self.symbol,
-            "price": round(self.price, 4),
-            "sma_20": round(self.sma_20, 4),
-            "bb_upper": round(self.bb_upper, 4),
-            "bb_lower": round(self.bb_lower, 4),
-            "rsi_14": round(self.rsi_14, 2),
-            "atr_14": round(self.atr_14, 4),
-            "adx_14": round(self.adx_14, 2),
-            "plus_di": round(self.plus_di, 2),
-            "minus_di": round(self.minus_di, 2),
-            "volume": self.volume,
-            "avg_volume": round(self.avg_volume, 0),
-            "volume_ratio": round(self.volume_ratio, 2),
-            "below_bb": self.is_below_lower_bb,
-            "oversold": self.is_oversold,
-            "not_trending": self.is_not_trending,
-            "vol_spike": self.has_volume_spike,
-            "all_met": self.all_entry_conditions_met,
-        }
+        """Count how many entry conditions are met."""
+        count = 0
+        if self.is_below_lower_band:
+            count += 1
+        if self.is_oversold:
+            count += 1
+        if self.is_trending:
+            count += 1
+        if self.has_volume_confirmation:
+            count += 1
+        return count
+    
+    @property
+    def all_entry_conditions_met(self) -> bool:
+        """Check if all 4 entry conditions are met."""
+        return self.conditions_met_count == 4
 
 
-def validate_dataframe(df: pd.DataFrame, min_rows: int = 50) -> bool:
+def calculate_sma(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Calculate Simple Moving Average."""
+    return ta.sma(df['close'], length=period)
+
+
+def calculate_bollinger_bands(
+    df: pd.DataFrame,
+    period: int = 20,
+    std_dev: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     """
-    Validate that the DataFrame has the required columns and enough data.
-    We need at least 50 rows for reliable indicator calculation
-    (20 for BB/SMA + buffer for ATR/RSI warm-up).
+    Calculate Bollinger Bands.
+    
+    Returns:
+        Tuple of (lower_band, mid_band, upper_band)
     """
-    required_cols = {"open", "high", "low", "close", "volume"}
-    if not required_cols.issubset(set(df.columns)):
-        missing = required_cols - set(df.columns)
-        raise ValueError(f"DataFrame missing columns: {missing}")
+    bbands = ta.bbands(df['close'], length=period, std=std_dev)
+    
+    if bbands is None or bbands.empty:
+        empty = pd.Series([None] * len(df), index=df.index)
+        return empty, empty, empty
+    
+    # pandas_ta bbands column names vary by version
+    # Could be: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0
+    # Or: BBL_20_2, BBM_20_2, BBU_20_2 (without decimal)
+    # Find columns by prefix
+    cols = bbands.columns.tolist()
+    
+    lower_col = None
+    mid_col = None
+    upper_col = None
+    
+    for col in cols:
+        if col.startswith('BBL'):
+            lower_col = col
+        elif col.startswith('BBM'):
+            mid_col = col
+        elif col.startswith('BBU'):
+            upper_col = col
+    
+    if lower_col and mid_col and upper_col:
+        return bbands[lower_col], bbands[mid_col], bbands[upper_col]
+    
+    # Fallback: return empty series
+    empty = pd.Series([None] * len(df), index=df.index)
+    return empty, empty, empty
 
-    if len(df) < min_rows:
-        raise ValueError(
-            f"Need at least {min_rows} rows for indicator calculation, got {len(df)}"
+
+def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Relative Strength Index."""
+    return ta.rsi(df['close'], length=period)
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Average True Range."""
+    return ta.atr(df['high'], df['low'], df['close'], length=period)
+
+
+def calculate_adx(
+    df: pd.DataFrame,
+    period: int = 14
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate ADX with Directional Indicators.
+    
+    Returns:
+        Tuple of (adx, plus_di, minus_di)
+    """
+    adx_data = ta.adx(df['high'], df['low'], df['close'], length=period)
+    
+    if adx_data is None:
+        return pd.Series(), pd.Series(), pd.Series()
+    
+    # Column names: ADX_14, DMP_14, DMN_14
+    adx_col = f'ADX_{period}'
+    plus_di_col = f'DMP_{period}'
+    minus_di_col = f'DMN_{period}'
+    
+    return adx_data[adx_col], adx_data[plus_di_col], adx_data[minus_di_col]
+
+
+def calculate_volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Calculate volume ratio (current volume / average volume)."""
+    avg_volume = df['volume'].rolling(window=period).mean()
+    return df['volume'] / avg_volume
+
+
+def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate all indicators and add them to the dataframe.
+    
+    Args:
+        df: DataFrame with OHLCV columns (open, high, low, close, volume)
+        
+    Returns:
+        DataFrame with indicator columns added
+    """
+    result = df.copy()
+    
+    # Ensure lowercase column names
+    result.columns = [c.lower() for c in result.columns]
+    
+    # SMA
+    result['sma_20'] = calculate_sma(result, 20)
+    
+    # Bollinger Bands
+    bb_lower, bb_mid, bb_upper = calculate_bollinger_bands(result, 20, 2.0)
+    result['bb_lower'] = bb_lower
+    result['bb_mid'] = bb_mid
+    result['bb_upper'] = bb_upper
+    
+    # RSI
+    result['rsi_14'] = calculate_rsi(result, 14)
+    
+    # ATR
+    result['atr_14'] = calculate_atr(result, 14)
+    
+    # ADX
+    adx, plus_di, minus_di = calculate_adx(result, 14)
+    result['adx_14'] = adx
+    result['plus_di'] = plus_di
+    result['minus_di'] = minus_di
+    
+    # Volume
+    result['avg_volume'] = result['volume'].rolling(window=20).mean()
+    result['volume_ratio'] = calculate_volume_ratio(result, 20)
+    
+    return result
+
+
+def calculate_indicators(df: pd.DataFrame, symbol: str) -> Optional[IndicatorSnapshot]:
+    """
+    Calculate all indicators and return a snapshot of the latest values.
+    
+    This is the main function used by the strategy.
+    
+    Args:
+        df: DataFrame with OHLCV data
+        symbol: Stock symbol
+        
+    Returns:
+        IndicatorSnapshot with latest values, or None if calculation fails
+    """
+    if df is None or len(df) < 20:
+        return None
+    
+    try:
+        # Calculate all indicators
+        result = calculate_all_indicators(df)
+        
+        # Get the latest row
+        latest = result.iloc[-1]
+        
+        # Build snapshot - all required fields must be provided
+        return IndicatorSnapshot(
+            symbol=symbol,
+            price=float(latest['close']),
+            sma_20=float(latest['sma_20']) if pd.notna(latest['sma_20']) else 0.0,
+            bb_upper=float(latest['bb_upper']) if pd.notna(latest['bb_upper']) else 0.0,
+            bb_lower=float(latest['bb_lower']) if pd.notna(latest['bb_lower']) else 0.0,
+            rsi_14=float(latest['rsi_14']) if pd.notna(latest['rsi_14']) else 50.0,
+            atr_14=float(latest['atr_14']) if pd.notna(latest['atr_14']) else 0.0,
+            adx_14=float(latest['adx_14']) if pd.notna(latest['adx_14']) else 0.0,
+            plus_di=float(latest['plus_di']) if pd.notna(latest['plus_di']) else 0.0,
+            minus_di=float(latest['minus_di']) if pd.notna(latest['minus_di']) else 0.0,
+            volume=float(latest['volume']) if pd.notna(latest['volume']) else 0.0,
+            avg_volume=float(latest['avg_volume']) if pd.notna(latest['avg_volume']) else 0.0,
+            volume_ratio=float(latest['volume_ratio']) if pd.notna(latest['volume_ratio']) else 0.0,
+            bb_mid=float(latest['bb_mid']) if pd.notna(latest['bb_mid']) else 0.0
         )
+        
+    except Exception as e:
+        print(f"Error calculating indicators for {symbol}: {e}")
+        return None
 
-    if df["close"].isna().any():
-        raise ValueError("DataFrame contains NaN values in 'close' column")
 
-    return True
-
-
-def calculate_bollinger_bands(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+def get_latest_snapshot(df: pd.DataFrame, symbol: str) -> Optional[IndicatorSnapshot]:
     """
-    Calculate Bollinger Bands (20-period, 2 std dev).
-    Returns: (lower_band, middle_band/SMA, upper_band)
+    Alias for calculate_indicators for backwards compatibility.
     """
-    bbands = df.ta.bbands(length=BB_PERIOD, std=BB_STD_DEV)
-    # pandas-ta returns columns: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0, BBP_20_2.0
-    col_lower = f"BBL_{BB_PERIOD}_{BB_STD_DEV}_{BB_STD_DEV}"
-    col_mid = f"BBM_{BB_PERIOD}_{BB_STD_DEV}_{BB_STD_DEV}"
-    col_upper = f"BBU_{BB_PERIOD}_{BB_STD_DEV}_{BB_STD_DEV}"
-    return bbands[col_lower], bbands[col_mid], bbands[col_upper]
-
-
-def calculate_rsi(df: pd.DataFrame) -> pd.Series:
-    """Calculate RSI (14-period)."""
-    return df.ta.rsi(length=RSI_PERIOD)
-
-
-def calculate_atr(df: pd.DataFrame) -> pd.Series:
-    """Calculate ATR (14-period)."""
-    return df.ta.atr(length=ATR_PERIOD)
-
-
-def calculate_adx(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    Calculate ADX with +DI and -DI (14-period).
-    Returns: (adx, plus_di, minus_di)
-    """
-    adx_df = df.ta.adx(length=ADX_PERIOD)
-    # pandas-ta returns: ADX_14, DMP_14, DMN_14
-    col_adx = f"ADX_{ADX_PERIOD}"
-    col_dmp = f"DMP_{ADX_PERIOD}"
-    col_dmn = f"DMN_{ADX_PERIOD}"
-    return adx_df[col_adx], adx_df[col_dmp], adx_df[col_dmn]
-
-
-def calculate_sma(df: pd.DataFrame) -> pd.Series:
-    """Calculate SMA (20-period) - same as BB middle band."""
-    return df.ta.sma(length=SMA_PERIOD)
-
-
-def calculate_volume_ratio(df: pd.DataFrame) -> tuple[float, float, float]:
-    """
-    Calculate volume ratio for the latest bar.
-    Returns: (current_volume, average_volume, ratio)
-    """
-    current_vol = float(df["volume"].iloc[-1])
-    avg_vol = float(df["volume"].rolling(window=VOLUME_AVG_PERIOD).mean().iloc[-1])
-
-    if avg_vol == 0:
-        return current_vol, avg_vol, 0.0
-
-    ratio = current_vol / avg_vol
-    return current_vol, avg_vol, ratio
-
-
-def calculate_all_indicators(df: pd.DataFrame, symbol: str) -> IndicatorSnapshot:
-    """
-    Calculate ALL indicators for a symbol and return a snapshot.
-    This is the main function called by the strategy scanner.
-
-    Args:
-        df: DataFrame with OHLCV data (at least 50 rows of 15-min candles)
-        symbol: Ticker symbol (for labeling)
-
-    Returns:
-        IndicatorSnapshot with all values for the latest bar
-    """
-    # Validate input
-    validate_dataframe(df)
-
-    # Ensure columns are lowercase (Alpaca sometimes capitalizes)
-    df.columns = [c.lower() for c in df.columns]
-
-    # Calculate all indicators
-    bb_lower, bb_mid, bb_upper = calculate_bollinger_bands(df)
-    rsi = calculate_rsi(df)
-    atr = calculate_atr(df)
-    adx, plus_di, minus_di = calculate_adx(df)
-    sma = calculate_sma(df)
-    current_vol, avg_vol, vol_ratio = calculate_volume_ratio(df)
-
-    # Get latest values (last row)
-    latest_idx = -1
-
-    snapshot = IndicatorSnapshot(
-        symbol=symbol,
-        price=float(df["close"].iloc[latest_idx]),
-        sma_20=float(sma.iloc[latest_idx]) if not pd.isna(sma.iloc[latest_idx]) else 0.0,
-        bb_upper=float(bb_upper.iloc[latest_idx]) if not pd.isna(bb_upper.iloc[latest_idx]) else 0.0,
-        bb_lower=float(bb_lower.iloc[latest_idx]) if not pd.isna(bb_lower.iloc[latest_idx]) else 0.0,
-        rsi_14=float(rsi.iloc[latest_idx]) if not pd.isna(rsi.iloc[latest_idx]) else 50.0,
-        atr_14=float(atr.iloc[latest_idx]) if not pd.isna(atr.iloc[latest_idx]) else 0.0,
-        adx_14=float(adx.iloc[latest_idx]) if not pd.isna(adx.iloc[latest_idx]) else 0.0,
-        plus_di=float(plus_di.iloc[latest_idx]) if not pd.isna(plus_di.iloc[latest_idx]) else 0.0,
-        minus_di=float(minus_di.iloc[latest_idx]) if not pd.isna(minus_di.iloc[latest_idx]) else 0.0,
-        volume=current_vol,
-        avg_volume=avg_vol,
-        volume_ratio=vol_ratio,
-        timestamp=df.index[latest_idx] if isinstance(df.index, pd.DatetimeIndex) else None,
-    )
-
-    return snapshot
-
-
-def calculate_stop_loss(entry_price: float, atr: float, atr_multiplier: float) -> float:
-    """
-    Calculate stop loss price.
-    Stop = entry_price - (ATR x category_multiplier)
-
-    Args:
-        entry_price: The price at which the position was entered
-        atr: Current ATR(14) value
-        atr_multiplier: Category-specific multiplier (1.5x for HIGH_BETA, 2x for MODERATE/ETF)
-
-    Returns:
-        Stop loss price
-    """
-    stop_distance = atr * atr_multiplier
-    return entry_price - stop_distance
-
-
-def calculate_position_size(
-    equity: float,
-    entry_price: float,
-    stop_loss_price: float,
-    risk_pct: float = 0.02,
-    max_position_pct: float = 0.25,
-    vix_multiplier: float = 1.0,
-) -> int:
-    """
-    Calculate number of shares to buy using the 2% risk rule.
-
-    Formula:
-        risk_amount = equity * risk_pct * vix_multiplier
-        stop_distance = entry_price - stop_loss_price
-        shares_by_risk = risk_amount / stop_distance
-        shares_by_cap = (equity * max_position_pct) / entry_price
-        final_shares = min(shares_by_risk, shares_by_cap)
-
-    Args:
-        equity: Current portfolio equity
-        entry_price: Expected entry price
-        stop_loss_price: Calculated stop loss price
-        risk_pct: Risk per trade (default 2%)
-        max_position_pct: Max position as % of equity (default 25%)
-        vix_multiplier: Position size multiplier from VIX regime
-
-    Returns:
-        Number of shares (integer, rounded down)
-    """
-    if entry_price <= 0 or stop_loss_price >= entry_price:
-        return 0
-
-    # Risk-based sizing
-    risk_amount = equity * risk_pct * vix_multiplier
-    stop_distance = entry_price - stop_loss_price
-
-    if stop_distance <= 0:
-        return 0
-
-    shares_by_risk = risk_amount / stop_distance
-
-    # Cap-based sizing
-    max_position_value = equity * max_position_pct
-    shares_by_cap = max_position_value / entry_price
-
-    # Take the smaller of the two
-    final_shares = min(shares_by_risk, shares_by_cap)
-
-    # Round down to whole shares
-    return max(0, int(final_shares))
+    return calculate_indicators(df, symbol)

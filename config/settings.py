@@ -1,209 +1,124 @@
 """
-Velocity Engine - Central Configuration
-Loads all settings from environment variables with safe defaults.
+Velocity Engine Configuration
+Centralized settings loaded from environment variables.
 """
 
 import os
-from pathlib import Path
-from dotenv import load_dotenv
 from enum import Enum
+from typing import Optional
+from dotenv import load_dotenv
 
-# Load .env file from project root
-PROJECT_ROOT = Path(__file__).parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+# Load .env file
+load_dotenv()
 
-
-# ============================================================
-# Enums
-# ============================================================
 
 class TradingMode(Enum):
-    PAPER = "paper"
-    LIVE = "live"
+    """Trading mode - paper or live."""
+    PAPER = "PAPER"
+    LIVE = "LIVE"
 
 
-class VIXRegime(Enum):
-    NORMAL = "NORMAL"         # VIX < 20
-    ELEVATED = "ELEVATED"     # VIX 20-25
-    HIGH = "HIGH"             # VIX 25-30
-    EXTREME = "EXTREME"       # VIX > 35
+# =============================================================================
+# Alpaca API Configuration
+# =============================================================================
+
+ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
+
+# Trading mode from env, defaults to PAPER for safety
+_mode = os.getenv("ALPACA_TRADING_MODE", "PAPER").upper()
+ALPACA_TRADING_MODE: TradingMode = TradingMode.LIVE if _mode == "LIVE" else TradingMode.PAPER
 
 
-class SignalStatus(Enum):
-    SIGNAL = "SIGNAL"
-    WATCHING = "WATCHING"
-    NEUTRAL = "NEUTRAL"
-    TREND_BLOCKED = "TREND_BLOCKED"
+# =============================================================================
+# Risk Management Parameters
+# =============================================================================
+
+# Base capital for position sizing (used if account equity unavailable)
+BASE_CAPITAL: float = float(os.getenv("BASE_CAPITAL", "100000"))
+
+# Maximum number of concurrent positions
+MAX_POSITIONS: int = int(os.getenv("MAX_POSITIONS", "4"))
+
+# Risk per trade as decimal (0.02 = 2%)
+RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "0.02"))
+
+# Maximum position size as percentage of equity (0.25 = 25%)
+MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.25"))
+
+# Alpha Shield drawdown limit as decimal (0.15 = 15%)
+ALPHA_SHIELD_DRAWDOWN: float = float(os.getenv("ALPHA_SHIELD_DRAWDOWN", "0.15"))
 
 
-class CircuitBreakerState(Enum):
-    NOMINAL = "NOMINAL"       # Trading enabled
-    TRIPPED = "TRIPPED"       # Trading halted
+# =============================================================================
+# Scanning Configuration
+# =============================================================================
+
+# Minutes between scans
+SCAN_INTERVAL_MINUTES: int = int(os.getenv("SCAN_INTERVAL_MINUTES", "3"))
 
 
-class ExitReason(Enum):
-    TAKE_PROFIT = "TAKE_PROFIT"
-    STOP_LOSS = "STOP_LOSS"
-    MANUAL = "MANUAL"
-    EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"
+# =============================================================================
+# Database Configuration
+# =============================================================================
 
+DATABASE_HOST: str = os.getenv("DATABASE_HOST", "localhost")
+DATABASE_PORT: int = int(os.getenv("DATABASE_PORT", "5432"))
+DATABASE_NAME: str = os.getenv("DATABASE_NAME", "velocity_engine")
+DATABASE_USER: str = os.getenv("DATABASE_USER", "postgres")
+DATABASE_PASSWORD: str = os.getenv("DATABASE_PASSWORD", "")
 
-# ============================================================
-# Alpaca Configuration
-# ============================================================
-
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_TRADING_MODE = TradingMode(os.getenv("ALPACA_TRADING_MODE", "paper"))
-LIVE_TRADING_CONFIRMED = os.getenv("LIVE_TRADING_CONFIRMED", "false").lower() == "true"
-
-# Derive base URLs from mode
-if ALPACA_TRADING_MODE == TradingMode.LIVE:
-    ALPACA_BASE_URL = "https://api.alpaca.markets"
-    ALPACA_DATA_URL = "https://data.alpaca.markets"
-else:
-    ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
-    ALPACA_DATA_URL = "https://data.alpaca.markets"  # Data URL is same for both
-
-
-# ============================================================
-# Database
-# ============================================================
-
-DATABASE_URL = os.getenv(
+DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
-    "postgresql://velocity:velocity_pass@localhost:5432/velocity_engine"
+    f"postgresql://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
 )
 
 
-# ============================================================
-# Trading Parameters
-# ============================================================
+# =============================================================================
+# Logging Configuration
+# =============================================================================
 
-BASE_CAPITAL = float(os.getenv("BASE_CAPITAL", "100000"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "4"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))         # 2%
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))     # 25%
-DRAWDOWN_THRESHOLD = float(os.getenv("DRAWDOWN_THRESHOLD", "0.15")) # 15%
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 
-# ============================================================
-# Indicator Parameters (Velocity 2.0 - DO NOT CHANGE)
-# ============================================================
+# =============================================================================
+# Validation
+# =============================================================================
 
-BB_PERIOD = 20          # Bollinger Band period
-BB_STD_DEV = 2.0        # Bollinger Band standard deviations
-RSI_PERIOD = 14         # RSI period
-ATR_PERIOD = 14         # ATR period
-ADX_PERIOD = 14         # ADX period
-SMA_PERIOD = 20         # SMA period (same as BB, used for take profit)
-VOLUME_AVG_PERIOD = 20  # Volume average period
-
-# Entry thresholds
-RSI_OVERSOLD = 30       # RSI must be below this
-ADX_TREND_THRESHOLD = 30  # ADX must be below this (no strong trend)
-VOLUME_SPIKE_RATIO = 1.5  # Volume must be >= 1.5x average
-
-# VIX failsafe default (used when Yahoo Finance is unavailable)
-VIX_DEFAULT = 25.0      # Cautious default
-
-
-# ============================================================
-# VIX Regime Thresholds & Position Size Multipliers
-# ============================================================
-
-VIX_THRESHOLDS = {
-    VIXRegime.NORMAL:   {"min": 0,  "max": 20, "size_multiplier": 1.0,  "can_trade": True},
-    VIXRegime.ELEVATED: {"min": 20, "max": 25, "size_multiplier": 0.5,  "can_trade": True},
-    VIXRegime.HIGH:     {"min": 25, "max": 30, "size_multiplier": 0.25, "can_trade": True},
-    VIXRegime.EXTREME:  {"min": 35, "max": 999,"size_multiplier": 0.0,  "can_trade": False},
-}
-
-
-# ============================================================
-# Scan Schedule (minutes/seconds)
-# ============================================================
-
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "3"))
-MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
-VIX_UPDATE_MINUTES = int(os.getenv("VIX_UPDATE_MINUTES", "5"))
-EQUITY_RECONCILE_MINUTES = int(os.getenv("EQUITY_RECONCILE_MINUTES", "30"))
-BROKER_SYNC_MINUTES = int(os.getenv("BROKER_SYNC_MINUTES", "15"))
-
-
-# ============================================================
-# Market Hours (US Eastern)
-# ============================================================
-
-MARKET_OPEN_HOUR = 9
-MARKET_OPEN_MINUTE = 30
-MARKET_CLOSE_HOUR = 16
-MARKET_CLOSE_MINUTE = 0
-MARKET_TIMEZONE = "US/Eastern"
-
-
-# ============================================================
-# Data Feed
-# ============================================================
-
-CANDLE_TIMEFRAME = "15Min"  # 15-minute candles
-CANDLE_LOOKBACK_DAYS = 7    # Fetch 7 days of history for indicator calculation
-DATA_FEED = "iex"           # Alpaca IEX feed
-
-
-# ============================================================
-# Logging
-# ============================================================
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-LOG_DIR = PROJECT_ROOT / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-
-# ============================================================
-# API Server
-# ============================================================
-
-API_HOST = os.getenv("API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("API_PORT", "8000"))
-
-
-# ============================================================
-# Safety Checks on Import
-# ============================================================
-
-def validate_config():
-    """Run on startup to catch configuration errors early."""
+def validate_config() -> None:
+    """
+    Validate that required configuration is present.
+    Raises ValueError if critical settings are missing.
+    """
     errors = []
-
+    
     if not ALPACA_API_KEY:
-        errors.append("ALPACA_API_KEY is not set")
+        errors.append("ALPACA_API_KEY is required")
+    
     if not ALPACA_SECRET_KEY:
-        errors.append("ALPACA_SECRET_KEY is not set")
-
-    if ALPACA_TRADING_MODE == TradingMode.LIVE and not LIVE_TRADING_CONFIRMED:
-        errors.append(
-            "LIVE trading mode selected but LIVE_TRADING_CONFIRMED is not 'true'. "
-            "Set LIVE_TRADING_CONFIRMED=true in .env to enable live trading."
-        )
-
-    if RISK_PER_TRADE <= 0 or RISK_PER_TRADE > 0.05:
-        errors.append(f"RISK_PER_TRADE={RISK_PER_TRADE} is outside safe range (0-5%)")
-
-    if MAX_POSITIONS < 1 or MAX_POSITIONS > 10:
-        errors.append(f"MAX_POSITIONS={MAX_POSITIONS} is outside safe range (1-10)")
-
+        errors.append("ALPACA_SECRET_KEY is required")
+    
+    if RISK_PER_TRADE <= 0 or RISK_PER_TRADE > 0.1:
+        errors.append(f"RISK_PER_TRADE must be between 0 and 0.1, got {RISK_PER_TRADE}")
+    
+    if MAX_POSITIONS <= 0 or MAX_POSITIONS > 20:
+        errors.append(f"MAX_POSITIONS must be between 1 and 20, got {MAX_POSITIONS}")
+    
+    if MAX_POSITION_SIZE_PCT <= 0 or MAX_POSITION_SIZE_PCT > 1.0:
+        errors.append(f"MAX_POSITION_SIZE_PCT must be between 0 and 1, got {MAX_POSITION_SIZE_PCT}")
+    
+    if ALPHA_SHIELD_DRAWDOWN <= 0 or ALPHA_SHIELD_DRAWDOWN > 0.5:
+        errors.append(f"ALPHA_SHIELD_DRAWDOWN must be between 0 and 0.5, got {ALPHA_SHIELD_DRAWDOWN}")
+    
     if errors:
-        for e in errors:
-            print(f"  CONFIG ERROR: {e}")
-        raise SystemExit("Fix configuration errors in .env before starting.")
-
-    # Print startup config summary
-    print(f"  Mode:          {ALPACA_TRADING_MODE.value.upper()}")
+        raise ValueError("Configuration errors:\n" + "\n".join(f"  - {e}" for e in errors))
+    
+    # Print config summary
+    print(f"  Mode:          {ALPACA_TRADING_MODE.value}")
     print(f"  Base Capital:  ${BASE_CAPITAL:,.0f}")
     print(f"  Max Positions: {MAX_POSITIONS}")
-    print(f"  Risk/Trade:    {RISK_PER_TRADE*100:.1f}%")
-    print(f"  Max Position:  {MAX_POSITION_PCT*100:.0f}%")
-    print(f"  Drawdown Limit:{DRAWDOWN_THRESHOLD*100:.0f}%")
+    print(f"  Risk/Trade:    {RISK_PER_TRADE:.1%}")
+    print(f"  Max Position:  {MAX_POSITION_SIZE_PCT:.0%}")
+    print(f"  Drawdown Limit:{ALPHA_SHIELD_DRAWDOWN:.0%}")
     print(f"  Scan Interval: {SCAN_INTERVAL_MINUTES} min")
-    print(f"  Database:      {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else 'local'}")
+    print(f"  Database:      {DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}")

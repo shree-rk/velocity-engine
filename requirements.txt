@@ -1,41 +1,39 @@
-# Velocity Engine - Python Dependencies
-# Install: pip install -r requirements.txt
+# Velocity Engine Requirements
+# Batch 1 + Batch 2
 
-# Broker SDKs
-alpaca-py==0.28.1          # Official Alpaca SDK (paper + live trading)
+# === Core Dependencies ===
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
 
-# Data & Indicators
-pandas==2.2.2              # DataFrames for OHLCV data
-pandas-ta==0.4.71b0        # Technical indicators (BB, RSI, ATR, ADX, SMA)
-numpy==1.26.4              # Numerical computing
+# === Data & Indicators ===
+pandas>=2.0.0
+pandas-ta>=0.3.14b
+numpy>=1.24.0
 
-# Database
-sqlalchemy==2.0.30         # ORM + async support
-asyncpg==0.29.0            # Async PostgreSQL driver
-psycopg2-binary==2.9.9     # Sync PostgreSQL driver (for migrations)
-alembic==1.13.1            # Database migrations
+# === Broker APIs ===
+alpaca-py>=0.21.0
+yfinance>=0.2.36
 
-# Scheduling
-apscheduler==3.10.4        # Cron-like job scheduler
+# === Database ===
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+alembic>=1.13.0
 
-# API Server (optional dashboard backend)
-fastapi==0.111.0           # Async REST API
-uvicorn==0.30.1            # ASGI server
-websockets==12.0           # WebSocket support
+# === Scheduling ===
+apscheduler>=3.10.0
 
-# VIX Data
-yfinance==0.2.38           # Yahoo Finance (VIX feed)
+# === API Server (future) ===
+fastapi>=0.109.0
+uvicorn>=0.27.0
+websockets>=12.0
 
-# Utilities
-python-dotenv==1.0.1       # .env file loading
-structlog==24.2.0          # Structured JSON logging
-httpx==0.27.0              # Async HTTP client
-pytz==2024.1               # Timezone handling
+# === Testing ===
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
 
-# Testing
-pytest==8.2.1
-pytest-asyncio==0.23.7
-pytest-cov==5.0.0
-
-# Type checking (optional)
-mypy==1.10.0
+# === Development ===
+black>=24.0.0
+isort>=5.13.0
+mypy>=1.8.0
