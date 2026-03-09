@@ -1,436 +1,553 @@
 """
-Tests for Iron Condor Strategy
+Tests for Iron Condor Strategy - Ported from Loveable
 """
 
 import pytest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from strategies.ic_config import ICConfig, ICUnderlying
-from strategies.ic_models import (
-    IronCondor, ICSignal, ICStatus, ICCloseReason,
-    OptionContract, VerticalSpread, OptionType
+from strategies.ic_config import (
+    ICConfig, IC_CONFIG, VIXRegime, ICPositionStatus, ICCloseReason,
+    UNDERLYING_CONFIGS, get_underlying_config, is_event_blocked, get_event_warning,
+    VIXConfig, EntryConfig, ExitConfig, PositionConfig
 )
-from strategies.iron_condor import IronCondorStrategy, ICStrategyStatus
+from strategies.ic_models import (
+    IronCondor, ICEntrySignal, ICExitSignal,
+    OptionContract, VerticalSpread, OptionType, GreeksSnapshot
+)
+from strategies.iron_condor import IronCondorStrategy, GateResult
 
+
+# =============================================================================
+# CONFIG TESTS
+# =============================================================================
 
 class TestICConfig:
     """Tests for IC configuration."""
     
-    def test_default_config(self):
+    def test_default_config_values(self):
+        """Test default configuration values match Loveable spec."""
         config = ICConfig()
         
-        assert config.target_dte == 7
-        assert config.short_put_delta == 0.10
-        assert config.risk_per_trade_pct == 0.02
-        assert config.profit_target_pct == 0.50
-        assert ICUnderlying.SPY in config.underlyings
-        assert ICUnderlying.SPX in config.underlyings
-    
-    def test_spread_width(self):
+        # VIX thresholds (3-tier)
+        assert config.vix.normal_threshold == 20.0
+        assert config.vix.elevated_threshold == 23.0
+        assert config.vix.critical_threshold == 25.0
+        
+        # Entry config
+        assert config.entry.max_entry_delta == 0.18
+        assert config.entry.max_iv_rank == 25.0
+        assert config.entry.max_widen_attempts == 5
+        
+        # Exit config (dual profit targets)
+        assert config.exit.profit_target_max_pct == 50.0
+        assert config.exit.profit_target_premium_pct == 70.0
+        assert config.exit.stop_loss_multiplier == 1.5  # Tighter than 2x
+        assert config.exit.delta_exit == 0.25
+        assert config.exit.dte_safety_exit == 2
+        
+        # Position limits
+        assert config.position.max_condors_per_100k == 6
+        
+    def test_vix_regime_classification(self):
+        """Test VIX regime is correctly classified."""
+        vix_config = VIXConfig()
+        
+        assert vix_config.get_regime(15.0) == VIXRegime.NORMAL
+        assert vix_config.get_regime(19.9) == VIXRegime.NORMAL
+        assert vix_config.get_regime(20.0) == VIXRegime.ELEVATED
+        assert vix_config.get_regime(22.9) == VIXRegime.ELEVATED
+        assert vix_config.get_regime(23.0) == VIXRegime.HIGH
+        assert vix_config.get_regime(24.9) == VIXRegime.HIGH
+        assert vix_config.get_regime(25.0) == VIXRegime.CRITICAL
+        assert vix_config.get_regime(35.0) == VIXRegime.CRITICAL
+        
+    def test_vix_entry_blocking(self):
+        """Test VIX blocks entry at critical level."""
+        vix_config = VIXConfig()
+        
+        # Should allow entry
+        can_enter, _ = vix_config.can_enter(15.0)
+        assert can_enter is True
+        
+        can_enter, _ = vix_config.can_enter(22.0)
+        assert can_enter is True
+        
+        # Should block entry at HIGH (>= 23)
+        can_enter, msg = vix_config.can_enter(23.0)
+        assert can_enter is False
+        assert "NO ENTRY" in msg
+        
+        # Should block entry at CRITICAL
+        can_enter, msg = vix_config.can_enter(30.0)
+        assert can_enter is False
+        
+    def test_vix_position_multiplier(self):
+        """Test VIX-based position sizing multipliers."""
+        vix_config = VIXConfig()
+        
+        # Normal: full size
+        assert vix_config.get_multiplier(15.0) == 1.0
+        
+        # Elevated: 50%
+        assert vix_config.get_multiplier(21.0) == 0.5
+        
+        # Critical: no new positions
+        assert vix_config.get_multiplier(25.0) == 0.0
+        
+    def test_underlying_configs(self):
+        """Test underlying configurations."""
+        spy_config = get_underlying_config("SPY")
+        assert spy_config is not None
+        assert spy_config.symbol == "SPY"
+        assert spy_config.option_symbol == "SPY"
+        assert spy_config.min_strike_width == 5
+        assert spy_config.max_condors == 3
+        
+        spx_config = get_underlying_config("SPX")
+        assert spx_config is not None
+        assert spx_config.option_symbol == "SPXW"  # Weekly options
+        assert spx_config.min_strike_width == 25
+        assert spx_config.cash_settled is True
+        assert spx_config.tax_advantaged is True
+        
+        qqq_config = get_underlying_config("QQQ")
+        assert qqq_config is not None
+        assert qqq_config.iv_index == "VXN"
+        
+    def test_max_condors_scaling(self):
+        """Test max condors scales with account size."""
         config = ICConfig()
         
-        assert config.get_spread_width(ICUnderlying.SPY) == 5
-        assert config.get_spread_width(ICUnderlying.SPX) == 50
-        assert config.get_spread_width(ICUnderlying.QQQ) == 5
+        assert config.get_max_condors(50000) == 3   # $50K = 3 condors
+        assert config.get_max_condors(100000) == 6  # $100K = 6 condors
+        assert config.get_max_condors(200000) == 12 # $200K = 12 condors
+        assert config.get_max_condors(1000000) == 60 # $1M = 60 condors
 
+
+# =============================================================================
+# EVENT CALENDAR TESTS
+# =============================================================================
+
+class TestEventCalendar:
+    """Tests for economic event calendar."""
+    
+    def test_fomc_blocks_entry(self):
+        """Test FOMC days block entry."""
+        blocked, event = is_event_blocked(date(2025, 3, 19))
+        assert blocked is True
+        assert "FOMC" in event
+        
+    def test_cpi_blocks_entry(self):
+        """Test CPI release days block entry."""
+        blocked, event = is_event_blocked(date(2025, 3, 12))
+        assert blocked is True
+        assert "CPI" in event
+        
+    def test_nfp_blocks_entry(self):
+        """Test NFP (jobs) days block entry."""
+        blocked, event = is_event_blocked(date(2025, 3, 7))
+        assert blocked is True
+        assert "NFP" in event or "Jobs" in event
+        
+    def test_quad_witch_blocks_entry(self):
+        """Test quad witching blocks entry."""
+        blocked, event = is_event_blocked(date(2025, 3, 21))
+        assert blocked is True
+        assert "Quad" in event or "Witch" in event
+        
+    def test_normal_day_allows_entry(self):
+        """Test normal days allow entry."""
+        blocked, _ = is_event_blocked(date(2025, 3, 10))  # Monday, no events
+        assert blocked is False
+        
+    def test_event_warning_day_before(self):
+        """Test warning is generated day before event."""
+        warning = get_event_warning(date(2025, 3, 18))  # Day before FOMC
+        assert warning is not None
+        assert "FOMC" in warning
+
+
+# =============================================================================
+# OPTION CONTRACT TESTS
+# =============================================================================
 
 class TestOptionContract:
-    """Tests for OptionContract."""
+    """Tests for OptionContract model."""
     
     def test_option_creation(self):
+        """Test creating an option contract."""
         opt = OptionContract(
             symbol="SPY",
-            expiration=date(2026, 3, 14),
-            strike=500.0,
+            expiration=date(2026, 3, 20),
+            strike=600.0,
             option_type=OptionType.PUT,
             delta=-0.10,
-            bid=1.50,
-            ask=1.60,
-            mid=1.55
+            gamma=0.02,
+            bid=2.50,
+            ask=2.60,
         )
         
         assert opt.symbol == "SPY"
-        assert opt.strike == 500.0
+        assert opt.strike == 600.0
         assert opt.option_type == OptionType.PUT
         assert opt.delta == -0.10
-    
+        
     def test_dte_calculation(self):
-        # Create option expiring in 7 days
+        """Test DTE calculation."""
         future = date.today() + timedelta(days=7)
         opt = OptionContract(
             symbol="SPY",
             expiration=future,
-            strike=500.0,
+            strike=600.0,
             option_type=OptionType.PUT
         )
         
         assert opt.dte == 7
+        
+    def test_occ_symbol_building(self):
+        """Test OCC symbol construction."""
+        opt = OptionContract(
+            symbol="SPY",
+            expiration=date(2026, 3, 13),
+            strike=638.0,
+            option_type=OptionType.PUT
+        )
+        
+        occ = opt.build_occ_symbol()
+        # SPY260313P00638000
+        assert occ.startswith("SPY")
+        assert "260313" in occ
+        assert "P" in occ
+        assert "00638000" in occ
 
+
+# =============================================================================
+# VERTICAL SPREAD TESTS
+# =============================================================================
 
 class TestVerticalSpread:
-    """Tests for VerticalSpread."""
+    """Tests for VerticalSpread model."""
     
     def test_put_spread(self):
+        """Test put spread (bull put spread)."""
         short_put = OptionContract(
-            symbol="SPY",
-            expiration=date(2026, 3, 14),
-            strike=500.0,
-            option_type=OptionType.PUT,
-            mid=2.00
+            symbol="SPY", expiration=date(2026, 3, 20),
+            strike=595.0, option_type=OptionType.PUT,
+            mid=1.50
         )
         long_put = OptionContract(
-            symbol="SPY",
-            expiration=date(2026, 3, 14),
-            strike=495.0,
-            option_type=OptionType.PUT,
-            mid=1.00
+            symbol="SPY", expiration=date(2026, 3, 20),
+            strike=590.0, option_type=OptionType.PUT,
+            mid=0.80
         )
         
         spread = VerticalSpread(short_leg=short_put, long_leg=long_put)
         
-        assert spread.width == 5.0
         assert spread.is_put_spread is True
         assert spread.is_call_spread is False
-        assert spread.credit == 1.00  # 2.00 - 1.00
-    
+        assert spread.width == 5.0
+        assert spread.credit == 0.70  # 1.50 - 0.80
+        
     def test_call_spread(self):
+        """Test call spread (bear call spread)."""
         short_call = OptionContract(
-            symbol="SPY",
-            expiration=date(2026, 3, 14),
-            strike=520.0,
-            option_type=OptionType.CALL,
-            mid=2.00
+            symbol="SPY", expiration=date(2026, 3, 20),
+            strike=605.0, option_type=OptionType.CALL,
+            mid=1.40
         )
         long_call = OptionContract(
-            symbol="SPY",
-            expiration=date(2026, 3, 14),
-            strike=525.0,
-            option_type=OptionType.CALL,
-            mid=1.00
+            symbol="SPY", expiration=date(2026, 3, 20),
+            strike=610.0, option_type=OptionType.CALL,
+            mid=0.75
         )
         
         spread = VerticalSpread(short_leg=short_call, long_leg=long_call)
         
-        assert spread.width == 5.0
         assert spread.is_call_spread is True
-        assert spread.credit == 1.00
+        assert spread.is_put_spread is False
+        assert spread.width == 5.0
+        assert abs(spread.credit - 0.65) < 0.001  # Float comparison
 
+
+# =============================================================================
+# IRON CONDOR TESTS
+# =============================================================================
 
 class TestIronCondor:
-    """Tests for IronCondor."""
+    """Tests for IronCondor model."""
     
-    def create_test_ic(self) -> IronCondor:
-        """Create a test Iron Condor."""
-        exp = date.today() + timedelta(days=7)
+    @pytest.fixture
+    def sample_ic(self):
+        """Create a sample Iron Condor for testing."""
+        expiration = date.today() + timedelta(days=7)
         
-        # Put spread
-        short_put = OptionContract("SPY", exp, 500.0, OptionType.PUT, mid=2.00)
-        long_put = OptionContract("SPY", exp, 495.0, OptionType.PUT, mid=1.00)
-        put_spread = VerticalSpread(short_put, long_put)
+        put_spread = VerticalSpread(
+            short_leg=OptionContract("SPY", expiration, 595.0, OptionType.PUT, mid=1.50),
+            long_leg=OptionContract("SPY", expiration, 590.0, OptionType.PUT, mid=0.80)
+        )
+        call_spread = VerticalSpread(
+            short_leg=OptionContract("SPY", expiration, 605.0, OptionType.CALL, mid=1.40),
+            long_leg=OptionContract("SPY", expiration, 610.0, OptionType.CALL, mid=0.75)
+        )
         
-        # Call spread
-        short_call = OptionContract("SPY", exp, 520.0, OptionType.CALL, mid=2.00)
-        long_call = OptionContract("SPY", exp, 525.0, OptionType.CALL, mid=1.00)
-        call_spread = VerticalSpread(short_call, long_call)
-        
-        return IronCondor(
+        ic = IronCondor(
+            id=1,
             underlying="SPY",
-            expiration=exp,
+            expiration=expiration,
             put_spread=put_spread,
             call_spread=call_spread,
             contracts=2,
-            entry_credit=2.00,  # Total credit $2.00
-            status=ICStatus.OPEN
+            status=ICPositionStatus.OPEN,
+            entry_credit=1.35,
+            entry_vix=18.0,
         )
+        
+        return ic
     
-    def test_ic_strikes(self):
-        ic = self.create_test_ic()
+    def test_ic_strikes(self, sample_ic):
+        """Test IC strike properties."""
+        assert sample_ic.short_put_strike == 595.0
+        assert sample_ic.long_put_strike == 590.0
+        assert sample_ic.short_call_strike == 605.0
+        assert sample_ic.long_call_strike == 610.0
         
-        assert ic.short_put_strike == 500.0
-        assert ic.long_put_strike == 495.0
-        assert ic.short_call_strike == 520.0
-        assert ic.long_call_strike == 525.0
-    
-    def test_ic_credit(self):
-        ic = self.create_test_ic()
+    def test_ic_wing_width(self, sample_ic):
+        """Test wing width calculation."""
+        assert sample_ic.wing_width == 5.0
         
-        # Total credit = $2.00 per contract x 2 contracts x 100 multiplier
-        assert ic.total_credit == 400.0
-    
-    def test_ic_max_loss(self):
-        ic = self.create_test_ic()
+    def test_ic_credit(self, sample_ic):
+        """Test total credit calculation."""
+        # entry_credit * contracts * 100
+        assert sample_ic.total_credit == 1.35 * 2 * 100
         
-        # Max loss = (width - credit) x contracts x 100
-        # = (5 - 2) x 2 x 100 = $600
-        assert ic.max_loss == 600.0
-    
-    def test_ic_breakevens(self):
-        ic = self.create_test_ic()
+    def test_ic_max_loss(self, sample_ic):
+        """Test max loss calculation."""
+        # (width - credit) * contracts * 100
+        expected = (5.0 - 1.35) * 2 * 100
+        assert sample_ic.max_loss == expected
         
-        # Lower BE = short put - credit = 500 - 2 = 498
-        assert ic.breakeven_low == 498.0
+    def test_ic_breakevens(self, sample_ic):
+        """Test breakeven prices."""
+        assert sample_ic.breakeven_low == 595.0 - 1.35  # short put - credit
+        assert sample_ic.breakeven_high == 605.0 + 1.35  # short call + credit
         
-        # Upper BE = short call + credit = 520 + 2 = 522
-        assert ic.breakeven_high == 522.0
-    
-    def test_profit_target(self):
-        ic = self.create_test_ic()
+    def test_ic_dte(self, sample_ic):
+        """Test DTE calculation."""
+        assert sample_ic.dte == 7
         
-        # 50% of credit = $1.00 to close
-        assert ic.profit_target_price == 1.00
-    
-    def test_stop_loss(self):
-        ic = self.create_test_ic()
+    def test_ic_profit_target(self, sample_ic):
+        """Test 50% profit target price."""
+        assert sample_ic.profit_target_price == 1.35 * 0.50
         
-        # 2x credit = $4.00 stop
-        assert ic.stop_loss_price == 4.00
-    
-    def test_to_dict(self):
-        ic = self.create_test_ic()
-        d = ic.to_dict()
-        
-        assert d["underlying"] == "SPY"
-        assert d["short_put"] == 500.0
-        assert d["short_call"] == 520.0
-        assert d["entry_credit"] == 2.00
+    def test_ic_stop_loss(self, sample_ic):
+        """Test 1.5x stop loss price."""
+        assert sample_ic.stop_loss_price == 1.35 * 1.5
 
 
-class TestICSignal:
-    """Tests for IC Signal."""
+# =============================================================================
+# ENTRY SIGNAL TESTS
+# =============================================================================
+
+class TestICEntrySignal:
+    """Tests for ICEntrySignal model."""
     
-    def test_signal_creation(self):
-        signal = ICSignal(
+    def test_entry_signal_creation(self):
+        """Test creating an entry signal."""
+        signal = ICEntrySignal(
             underlying="SPY",
-            expiration=date(2026, 3, 14),
-            short_put_strike=500.0,
-            long_put_strike=495.0,
-            short_call_strike=520.0,
-            long_call_strike=525.0,
-            expected_credit=2.00,
-            expected_max_loss=300.0,
-            short_put_delta=-0.10,
+            expiration=date.today() + timedelta(days=7),
+            short_put_strike=595.0,
+            long_put_strike=590.0,
+            short_call_strike=605.0,
+            long_call_strike=610.0,
+            wing_width=5.0,
+            quantity=2,
+            vix_multiplier=1.0,
+            short_put_delta=0.10,
             short_call_delta=0.10,
-            underlying_price=510.0,
-            vix_at_signal=25.0,
-            recommended_contracts=2
+            spot_price=600.0,
+            vix_value=18.0,
+            iv_rank=20.0,
+            estimated_credit=1.35,
+            max_risk=730.0,
         )
         
         assert signal.underlying == "SPY"
-        assert signal.expected_credit == 2.00
-        assert signal.recommended_contracts == 2
-    
-    def test_credit_percentage(self):
-        signal = ICSignal(
-            underlying="SPY",
-            expiration=date(2026, 3, 14),
-            short_put_strike=500.0,
-            long_put_strike=495.0,
-            short_call_strike=520.0,
-            long_call_strike=525.0,
-            expected_credit=1.50,  # $1.50 credit on $5 width = 30%
-            expected_max_loss=350.0,
-            short_put_delta=-0.10,
-            short_call_delta=0.10,
-            underlying_price=510.0,
-            vix_at_signal=25.0,
-            recommended_contracts=2
-        )
+        assert signal.quantity == 2
+        assert signal.estimated_credit == 1.35
         
-        assert signal.credit_pct_of_width == 0.30
-
-
-class TestIronCondorStrategy:
-    """Tests for IC Strategy."""
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_strategy_initialization(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        
-        assert strategy.name == "iron_condor"
-        assert strategy.enabled is True
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_get_status_vix_in_range(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        status = strategy.get_status()
-        
-        assert status.vix_value == 25.0
-        assert status.vix_allows_entry is True
-        assert status.can_open_new is True
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_get_status_vix_too_low(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=12.0, regime=MagicMock(value="NORMAL"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        status = strategy.get_status()
-        
-        assert status.vix_allows_entry is False
-        assert status.can_open_new is False
-        assert "too low" in status.message.lower()
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_get_status_vix_too_high(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=40.0, regime=MagicMock(value="EXTREME"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        status = strategy.get_status()
-        
-        assert status.vix_allows_entry is False
-        assert status.can_open_new is False
-    
-    def test_position_sizing_spy(self):
-        strategy = IronCondorStrategy(account_value=100000)
-        
-        # $300 max loss per contract, 2% risk = $2000
-        # Should allow ~6 contracts
-        contracts = strategy.calculate_position_size(300.0, ICUnderlying.SPY)
-        
-        assert contracts == 6
-    
-    def test_position_sizing_spx(self):
-        strategy = IronCondorStrategy(account_value=100000)
-        
-        # $3000 max loss per SPX contract, 2% risk = $2000
-        # Would allow 0, but minimum is 1, capped at 2 for SPX
-        contracts = strategy.calculate_position_size(3000.0, ICUnderlying.SPX)
-        
-        assert contracts == 1  # Capped due to risk
-    
-    def test_find_expiration(self):
-        strategy = IronCondorStrategy()
-        
-        exp = strategy.find_target_expiration(ICUnderlying.SPY)
-        
-        assert exp is not None
-        dte = (exp - date.today()).days
-        assert 5 <= dte <= 10  # Within acceptable range
-        assert exp.weekday() == 4  # Friday
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_check_exit_profit_target(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        
-        # Create open position with $2 credit
-        ic = IronCondor(
-            underlying="SPY",
-            expiration=date.today() + timedelta(days=5),
-            status=ICStatus.OPEN,
-            entry_credit=2.00
-        )
-        
-        # Current price $0.90 = 55% profit
-        reason = strategy.check_exit_conditions(ic, 0.90)
-        
-        assert reason == ICCloseReason.PROFIT_TARGET
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_check_exit_stop_loss(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        
-        ic = IronCondor(
-            underlying="SPY",
-            expiration=date.today() + timedelta(days=5),
-            status=ICStatus.OPEN,
-            entry_credit=2.00
-        )
-        
-        # Current price $4.50 = 2.25x credit (stop loss)
-        reason = strategy.check_exit_conditions(ic, 4.50)
-        
-        assert reason == ICCloseReason.STOP_LOSS
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_check_exit_dte(self, mock_events, mock_vix):
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy()
-        
-        # Position expiring in 2 days
-        ic = IronCondor(
-            underlying="SPY",
-            expiration=date.today() + timedelta(days=2),
-            status=ICStatus.OPEN,
-            entry_credit=2.00
-        )
-        
-        reason = strategy.check_exit_conditions(ic, 1.50)
-        
-        assert reason == ICCloseReason.DTE_EXIT
-
-
-class TestICIntegration:
-    """Integration tests for IC strategy."""
-    
-    @patch('strategies.iron_condor.check_vix')
-    @patch('strategies.iron_condor.get_events_for_date')
-    def test_full_trade_cycle(self, mock_events, mock_vix):
-        """Test opening and closing a position."""
-        mock_vix.return_value = MagicMock(value=25.0, regime=MagicMock(value="HIGH"))
-        mock_events.return_value = []
-        
-        strategy = IronCondorStrategy(account_value=100000)
-        
-        # Create signal
-        signal = ICSignal(
+    def test_credit_pct_of_width(self):
+        """Test credit as percentage of width calculation."""
+        signal = ICEntrySignal(
             underlying="SPY",
             expiration=date.today() + timedelta(days=7),
-            short_put_strike=500.0,
-            long_put_strike=495.0,
-            short_call_strike=520.0,
-            long_call_strike=525.0,
-            expected_credit=1.50,
-            expected_max_loss=350.0,
-            short_put_delta=-0.10,
+            short_put_strike=595.0,
+            long_put_strike=590.0,
+            short_call_strike=605.0,
+            long_call_strike=610.0,
+            wing_width=5.0,
+            quantity=1,
+            vix_multiplier=1.0,
+            short_put_delta=0.10,
             short_call_delta=0.10,
-            underlying_price=510.0,
-            vix_at_signal=25.0,
-            recommended_contracts=3
+            spot_price=600.0,
+            vix_value=18.0,
+            iv_rank=20.0,
+            estimated_credit=1.50,  # 30% of $5 width
+            max_risk=350.0,
         )
         
-        # Open position
-        ic = strategy.create_position(signal, fill_credit=1.45)
-        
-        assert ic.status == ICStatus.OPEN
-        assert ic.entry_credit == 1.45
-        assert ic.contracts == 3
-        assert len(strategy.get_open_positions()) == 1
-        
-        # Close position at profit
-        closed_ic = strategy.close_position(ic, close_debit=0.70, reason=ICCloseReason.PROFIT_TARGET)
-        
-        assert closed_ic.status == ICStatus.CLOSED
-        assert closed_ic.close_reason == ICCloseReason.PROFIT_TARGET
-        
-        # P&L = (1.45 - 0.70) x 3 x 100 = $225
-        assert closed_ic.realized_pnl == 225.0
-        
-        # Check total P&L
-        assert strategy.get_total_pnl() == 225.0
+        assert signal.credit_pct_of_width == 30.0
 
+
+# =============================================================================
+# STRATEGY TESTS
+# =============================================================================
+
+class TestIronCondorStrategy:
+    """Tests for IronCondorStrategy."""
+    
+    @pytest.fixture
+    def strategy(self):
+        """Create strategy for testing."""
+        return IronCondorStrategy(account_capital=100000.0)
+    
+    def test_strategy_initialization(self, strategy):
+        """Test strategy initializes correctly."""
+        assert strategy.account_capital == 100000.0
+        assert len(strategy.open_positions) == 0
+        
+    def test_portfolio_limit_gate(self, strategy):
+        """Test portfolio limit gate check."""
+        # With no positions, should pass
+        gate = strategy._check_gate_portfolio_limits()
+        assert gate.passed is True
+        assert "0/6" in gate.message
+        
+    def test_trading_enabled_gate(self, strategy):
+        """Test trading enabled gate."""
+        gate = strategy._check_gate_trading_enabled()
+        assert gate.passed is True
+        
+        # Disable trading
+        strategy.config.trading_enabled = False
+        gate = strategy._check_gate_trading_enabled()
+        assert gate.passed is False
+        
+    def test_vix_gate_normal(self, strategy):
+        """Test VIX gate with normal VIX."""
+        gate = strategy._check_gate_vix_filter(18.0)
+        assert gate.passed is True
+        assert gate.data["regime"] == "NORMAL"
+        
+    def test_vix_gate_elevated(self, strategy):
+        """Test VIX gate with elevated VIX."""
+        gate = strategy._check_gate_vix_filter(21.0)
+        assert gate.passed is True
+        assert gate.data["regime"] == "ELEVATED"
+        
+    def test_vix_gate_critical_blocks(self, strategy):
+        """Test VIX gate blocks at critical level."""
+        gate = strategy._check_gate_vix_filter(26.0)
+        assert gate.passed is False
+        assert "CRITICAL" in gate.message
+        
+    def test_iv_rank_gate(self, strategy):
+        """Test IV Rank gate."""
+        # Should pass with low IV Rank
+        gate = strategy._check_gate_iv_rank(20.0)
+        assert gate.passed is True
+        
+        # Should fail with high IV Rank
+        gate = strategy._check_gate_iv_rank(30.0)
+        assert gate.passed is False
+        assert "25" in gate.message  # Shows threshold
+        
+    def test_underlying_limit_gate(self, strategy):
+        """Test per-underlying position limit gate."""
+        gate = strategy._check_gate_underlying_limit("SPY")
+        assert gate.passed is True
+        assert "0/3" in gate.message
+        
+        # Unknown underlying
+        gate = strategy._check_gate_underlying_limit("FAKE")
+        assert gate.passed is False
+        
+    def test_delta_cooldown_gate(self, strategy):
+        """Test same-day delta exit cooldown gate."""
+        # No cooldown
+        gate = strategy._check_gate_delta_cooldown("SPY")
+        assert gate.passed is True
+        
+        # Set cooldown for today
+        from datetime import date
+        strategy.delta_exit_cooldowns["SPY"] = date.today()
+        
+        gate = strategy._check_gate_delta_cooldown("SPY")
+        assert gate.passed is False
+        assert "cooldown" in gate.message.lower()
+
+
+# =============================================================================
+# EXIT CONDITION TESTS
+# =============================================================================
+
+class TestExitConditions:
+    """Tests for exit conditions."""
+    
+    @pytest.fixture
+    def strategy_with_position(self):
+        """Create strategy with an open position."""
+        strategy = IronCondorStrategy(account_capital=100000.0)
+        
+        expiration = date.today() + timedelta(days=7)
+        
+        put_spread = VerticalSpread(
+            short_leg=OptionContract("SPY", expiration, 595.0, OptionType.PUT),
+            long_leg=OptionContract("SPY", expiration, 590.0, OptionType.PUT)
+        )
+        call_spread = VerticalSpread(
+            short_leg=OptionContract("SPY", expiration, 605.0, OptionType.CALL),
+            long_leg=OptionContract("SPY", expiration, 610.0, OptionType.CALL)
+        )
+        
+        position = IronCondor(
+            id=1,
+            underlying="SPY",
+            expiration=expiration,
+            put_spread=put_spread,
+            call_spread=call_spread,
+            contracts=2,
+            status=ICPositionStatus.OPEN,
+            entry_credit=1.35,
+            entry_vix=18.0,
+        )
+        
+        strategy.open_positions.append(position)
+        return strategy
+    
+    def test_dte_safety_exit(self, strategy_with_position):
+        """Test 2 DTE safety exit."""
+        # Set expiration to 2 days from now
+        position = strategy_with_position.open_positions[0]
+        position.expiration = date.today() + timedelta(days=2)
+        
+        # Create mock for _fetch_spot_price
+        strategy_with_position._fetch_spot_price = MagicMock(return_value=600.0)
+        strategy_with_position._get_position_current_price = MagicMock(return_value=0.50)
+        strategy_with_position._fetch_position_greeks = MagicMock(return_value=None)
+        
+        signals = strategy_with_position.check_exits()
+        
+        assert len(signals) == 1
+        assert signals[0].reason == ICCloseReason.DTE_SAFETY
+        assert signals[0].urgency == "HIGH"
+
+
+# =============================================================================
+# RUN TESTS
+# =============================================================================
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

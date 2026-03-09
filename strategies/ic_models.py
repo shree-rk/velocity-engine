@@ -1,47 +1,38 @@
 """
-Iron Condor Data Models
+Iron Condor Data Models - Ported from Loveable
+Data structures for Iron Condor positions, signals, and Greeks.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+from typing import Optional, List, Dict, Any
 from enum import Enum
-from typing import Optional, List
 
+from strategies.ic_config import ICPositionStatus, ICCloseReason
+
+
+# =============================================================================
+# OPTION CONTRACT
+# =============================================================================
 
 class OptionType(Enum):
     """Option type."""
-    CALL = "CALL"
-    PUT = "PUT"
-
-
-class ICStatus(Enum):
-    """Iron Condor position status."""
-    PENDING = "PENDING"
-    OPEN = "OPEN"
-    CLOSED = "CLOSED"
-    EXPIRED = "EXPIRED"
-    STOPPED = "STOPPED"
-
-
-class ICCloseReason(Enum):
-    """Reason for closing IC."""
-    PROFIT_TARGET = "PROFIT_TARGET"
-    STOP_LOSS = "STOP_LOSS"
-    DTE_EXIT = "DTE_EXIT"
-    MANUAL = "MANUAL"
-    EXPIRED = "EXPIRED"
-    ADJUSTMENT = "ADJUSTMENT"
+    CALL = "C"
+    PUT = "P"
 
 
 @dataclass
 class OptionContract:
     """Single option contract."""
-    symbol: str  # e.g., "SPY"
+    symbol: str  # Underlying e.g., "SPY"
     expiration: date
     strike: float
     option_type: OptionType
     
-    # Greeks (optional, populated from broker)
+    # OCC symbol (e.g., "SPY260313P00638000")
+    occ_symbol: Optional[str] = None
+    
+    # Greeks (from broker)
     delta: Optional[float] = None
     gamma: Optional[float] = None
     theta: Optional[float] = None
@@ -59,19 +50,25 @@ class OptionContract:
         """Days to expiration."""
         return (self.expiration - date.today()).days
     
-    @property
-    def option_symbol(self) -> str:
-        """Generate OCC option symbol."""
-        # Format: SPY240315C00500000 (SPY March 15 2024 $500 Call)
+    def build_occ_symbol(self, option_ticker: str = None) -> str:
+        """
+        Build OCC option symbol.
+        Format: SPY260313P00638000 (Symbol + YYMMDD + P/C + Strike*1000 padded to 8)
+        """
+        ticker = option_ticker or self.symbol
         exp_str = self.expiration.strftime("%y%m%d")
-        opt_type = "C" if self.option_type == OptionType.CALL else "P"
+        opt_type = self.option_type.value
         strike_str = f"{int(self.strike * 1000):08d}"
-        return f"{self.symbol}{exp_str}{opt_type}{strike_str}"
+        return f"{ticker}{exp_str}{opt_type}{strike_str}"
 
+
+# =============================================================================
+# VERTICAL SPREAD
+# =============================================================================
 
 @dataclass
 class VerticalSpread:
-    """Vertical spread (part of Iron Condor)."""
+    """Vertical spread (one side of Iron Condor)."""
     short_leg: OptionContract
     long_leg: OptionContract
     
@@ -82,12 +79,12 @@ class VerticalSpread:
     
     @property
     def is_put_spread(self) -> bool:
-        """Is this a put spread."""
+        """Is this a put spread (bull put spread)."""
         return self.short_leg.option_type == OptionType.PUT
     
     @property
     def is_call_spread(self) -> bool:
-        """Is this a call spread."""
+        """Is this a call spread (bear call spread)."""
         return self.short_leg.option_type == OptionType.CALL
     
     @property
@@ -105,37 +102,66 @@ class VerticalSpread:
     
     @property
     def short_delta(self) -> Optional[float]:
-        """Delta of short leg."""
-        return self.short_leg.delta
+        """Delta of short leg (absolute value)."""
+        if self.short_leg.delta is None:
+            return None
+        return abs(self.short_leg.delta)
 
+
+# =============================================================================
+# IRON CONDOR POSITION
+# =============================================================================
 
 @dataclass
 class IronCondor:
     """Complete Iron Condor position."""
+    # Identification
     id: Optional[int] = None
     underlying: str = ""
-    expiration: date = None
+    expiration: Optional[date] = None
     
     # The spreads
-    put_spread: VerticalSpread = None
-    call_spread: VerticalSpread = None
+    put_spread: Optional[VerticalSpread] = None
+    call_spread: Optional[VerticalSpread] = None
     
     # Position info
     contracts: int = 1
-    status: ICStatus = ICStatus.PENDING
+    status: ICPositionStatus = ICPositionStatus.PENDING
     
     # Entry details
     entry_time: Optional[datetime] = None
-    entry_credit: Optional[float] = None  # Total credit per contract
+    entry_credit: Optional[float] = None  # Credit per contract
     entry_vix: Optional[float] = None
+    entry_iv_rank: Optional[float] = None
+    entry_spot_price: Optional[float] = None
+    
+    # Entry Greeks (stored at fill)
+    entry_delta: Optional[float] = None
+    entry_gamma: Optional[float] = None
+    entry_theta: Optional[float] = None
+    entry_vega: Optional[float] = None
+    
+    # Current Greeks (updated each cycle)
+    current_delta: Optional[float] = None
+    current_gamma: Optional[float] = None
+    current_theta: Optional[float] = None
+    current_vega: Optional[float] = None
+    current_spot_price: Optional[float] = None
+    current_iv: Optional[float] = None
+    
+    # P&L tracking
+    unrealized_pnl: Optional[float] = None
+    unrealized_pnl_pct: Optional[float] = None
     
     # Exit details
     exit_time: Optional[datetime] = None
     exit_debit: Optional[float] = None
-    close_reason: Optional[ICCloseReason] = None
-    
-    # P&L
+    exit_reason: Optional[ICCloseReason] = None
     realized_pnl: Optional[float] = None
+    
+    # Order tracking
+    entry_order_id: Optional[str] = None
+    exit_order_id: Optional[str] = None
     
     @property
     def dte(self) -> int:
@@ -165,18 +191,18 @@ class IronCondor:
         return self.call_spread.long_leg.strike if self.call_spread else 0
     
     @property
+    def wing_width(self) -> float:
+        """Wing width (assumes symmetric)."""
+        if self.put_spread:
+            return self.put_spread.width
+        return 0
+    
+    @property
     def total_credit(self) -> Optional[float]:
-        """Total credit received."""
+        """Total credit received (all contracts)."""
         if self.entry_credit:
             return self.entry_credit * self.contracts * 100
-        
-        put_credit = self.put_spread.credit if self.put_spread else 0
-        call_credit = self.call_spread.credit if self.call_spread else 0
-        
-        if put_credit is None or call_credit is None:
-            return None
-        
-        return (put_credit + call_credit) * self.contracts * 100
+        return None
     
     @property
     def max_profit(self) -> Optional[float]:
@@ -186,13 +212,8 @@ class IronCondor:
     @property
     def max_loss(self) -> float:
         """Maximum loss."""
-        put_width = self.put_spread.width if self.put_spread else 0
-        call_width = self.call_spread.width if self.call_spread else 0
-        max_width = max(put_width, call_width)
-        
-        credit_per_contract = self.entry_credit or 0
-        
-        return (max_width - credit_per_contract) * self.contracts * 100
+        credit_per = self.entry_credit or 0
+        return (self.wing_width - credit_per) * self.contracts * 100
     
     @property
     def profit_target_price(self) -> Optional[float]:
@@ -203,10 +224,10 @@ class IronCondor:
     
     @property
     def stop_loss_price(self) -> Optional[float]:
-        """Price to close for stop loss (2x credit)."""
+        """Price to close for 1.5x stop loss."""
         if self.entry_credit is None:
             return None
-        return self.entry_credit * 2.0
+        return self.entry_credit * 1.5
     
     @property
     def breakeven_low(self) -> float:
@@ -220,16 +241,8 @@ class IronCondor:
         credit = self.entry_credit or 0
         return self.short_call_strike + credit
     
-    @property
-    def current_pnl(self) -> Optional[float]:
-        """Current unrealized P&L."""
-        if self.status == ICStatus.CLOSED:
-            return self.realized_pnl
-        # Would need current prices to calculate
-        return None
-    
-    def to_dict(self) -> dict:
-        """Convert to dictionary."""
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for storage/API."""
         return {
             "id": self.id,
             "underlying": self.underlying,
@@ -241,20 +254,31 @@ class IronCondor:
             "long_put": self.long_put_strike,
             "short_call": self.short_call_strike,
             "long_call": self.long_call_strike,
+            "wing_width": self.wing_width,
             "entry_credit": self.entry_credit,
             "total_credit": self.total_credit,
             "max_loss": self.max_loss,
             "entry_vix": self.entry_vix,
+            "entry_iv_rank": self.entry_iv_rank,
             "entry_time": self.entry_time.isoformat() if self.entry_time else None,
+            "entry_delta": self.entry_delta,
+            "current_delta": self.current_delta,
+            "current_gamma": self.current_gamma,
+            "unrealized_pnl": self.unrealized_pnl,
+            "unrealized_pnl_pct": self.unrealized_pnl_pct,
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
-            "close_reason": self.close_reason.value if self.close_reason else None,
+            "exit_reason": self.exit_reason.value if self.exit_reason else None,
             "realized_pnl": self.realized_pnl,
         }
 
 
+# =============================================================================
+# ENTRY SIGNAL
+# =============================================================================
+
 @dataclass
-class ICSignal:
-    """Signal to open an Iron Condor."""
+class ICEntrySignal:
+    """Validated entry signal ready for execution."""
     underlying: str
     expiration: date
     
@@ -263,37 +287,37 @@ class ICSignal:
     long_put_strike: float
     short_call_strike: float
     long_call_strike: float
+    wing_width: float
     
-    # Expected values
-    expected_credit: float
-    expected_max_loss: float
+    # Sizing
+    quantity: int
+    vix_multiplier: float
     
-    # Greeks at signal time
+    # Validated Greeks
     short_put_delta: float
     short_call_delta: float
     
-    # Context
-    underlying_price: float
-    vix_at_signal: float
-    signal_time: datetime = field(default_factory=lambda: datetime.now())
+    # Market data at signal
+    spot_price: float
+    vix_value: float
+    iv_rank: float
     
-    # Sizing
-    recommended_contracts: int = 1
+    # Expected values
+    estimated_credit: float
+    max_risk: float
     
-    @property
-    def risk_reward_ratio(self) -> float:
-        """Risk to reward ratio."""
-        if self.expected_credit == 0:
-            return float('inf')
-        return self.expected_max_loss / (self.expected_credit * 100)
+    # Metadata
+    signal_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    gate_results: List[Dict] = field(default_factory=list)
     
     @property
     def credit_pct_of_width(self) -> float:
         """Credit as percentage of spread width."""
-        width = self.short_put_strike - self.long_put_strike
-        return self.expected_credit / width if width > 0 else 0
+        if self.wing_width <= 0:
+            return 0
+        return (self.estimated_credit / self.wing_width) * 100
     
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
             "underlying": self.underlying,
@@ -302,12 +326,74 @@ class ICSignal:
             "long_put": self.long_put_strike,
             "short_call": self.short_call_strike,
             "long_call": self.long_call_strike,
-            "expected_credit": self.expected_credit,
-            "expected_max_loss": self.expected_max_loss,
+            "quantity": self.quantity,
             "short_put_delta": self.short_put_delta,
             "short_call_delta": self.short_call_delta,
-            "underlying_price": self.underlying_price,
-            "vix": self.vix_at_signal,
-            "recommended_contracts": self.recommended_contracts,
+            "spot_price": self.spot_price,
+            "vix": self.vix_value,
+            "iv_rank": self.iv_rank,
+            "estimated_credit": self.estimated_credit,
             "credit_pct": self.credit_pct_of_width,
         }
+
+
+# =============================================================================
+# EXIT SIGNAL
+# =============================================================================
+
+@dataclass
+class ICExitSignal:
+    """Signal to exit an Iron Condor position."""
+    position_id: int
+    reason: ICCloseReason
+    urgency: str  # LOW, MEDIUM, HIGH, CRITICAL
+    
+    # Current state
+    current_pnl: float
+    current_pnl_pct: float
+    current_delta: Optional[float] = None
+    current_gamma: Optional[float] = None
+    dte: int = 0
+    
+    # Details
+    message: str = ""
+    signal_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "position_id": self.position_id,
+            "reason": self.reason.value,
+            "urgency": self.urgency,
+            "current_pnl": self.current_pnl,
+            "current_pnl_pct": self.current_pnl_pct,
+            "current_delta": self.current_delta,
+            "dte": self.dte,
+            "message": self.message,
+        }
+
+
+# =============================================================================
+# GREEKS SNAPSHOT
+# =============================================================================
+
+@dataclass
+class GreeksSnapshot:
+    """Greeks for a position at a point in time."""
+    timestamp: datetime
+    
+    # Position Greeks (net)
+    delta: float
+    gamma: float
+    theta: float
+    vega: float
+    
+    # Individual leg Greeks
+    short_put_delta: Optional[float] = None
+    short_call_delta: Optional[float] = None
+    short_put_gamma: Optional[float] = None
+    short_call_gamma: Optional[float] = None
+    
+    # IV data
+    iv_value: Optional[float] = None
+    iv_rank: Optional[float] = None
