@@ -732,12 +732,30 @@ class IronCondorStrategy:
     
     def _fetch_vix(self) -> float:
         """Fetch current VIX value."""
+        # Try broker first
         if self.broker:
             try:
-                return self.broker.get_vix()
+                vix = self.broker.get_vix()
+                if vix and vix > 0:
+                    return vix
             except:
                 pass
-        return 20.0  # Default
+        
+        # Fallback to Yahoo Finance
+        try:
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^VIX")
+            hist = vix_ticker.history(period="1d")
+            if not hist.empty:
+                return float(hist['Close'].iloc[-1])
+            # Try info as backup
+            info = vix_ticker.info
+            if 'regularMarketPrice' in info:
+                return float(info['regularMarketPrice'])
+        except Exception as e:
+            logger.warning(f"Failed to fetch VIX from Yahoo: {e}")
+        
+        return 20.0  # Default only if all else fails
     
     def _fetch_spot_price(self, symbol: str) -> float:
         """Fetch current spot price."""
@@ -754,22 +772,29 @@ class IronCondorStrategy:
         return 20.0  # Default
     
     def _find_expiration(self) -> Optional[date]:
-        """Find expiration date ~7 DTE (next Friday)."""
+        """Find best Friday expiration within DTE range."""
         today = date.today()
-        target = today + timedelta(days=self.config.strikes.target_dte)
+        min_dte = self.config.strikes.min_dte
+        max_dte = self.config.strikes.max_dte
+        target_dte = self.config.strikes.target_dte
         
-        # Find next Friday
-        days_to_friday = (4 - target.weekday()) % 7
-        if days_to_friday == 0 and target == today:
-            days_to_friday = 7
+        # Find all Fridays within the DTE range
+        valid_fridays = []
+        for days_ahead in range(1, max_dte + 7):  # Look ahead enough
+            check_date = today + timedelta(days=days_ahead)
+            if check_date.weekday() == 4:  # Friday
+                dte = days_ahead
+                if min_dte <= dte <= max_dte:
+                    valid_fridays.append((check_date, dte))
         
-        expiration = target + timedelta(days=days_to_friday)
-        dte = (expiration - today).days
+        if not valid_fridays:
+            logger.warning(f"No valid Friday expiration found in range {min_dte}-{max_dte} DTE")
+            return None
         
-        if self.config.strikes.min_dte <= dte <= self.config.strikes.max_dte:
-            return expiration
-        
-        return None
+        # Pick the one closest to target DTE
+        best = min(valid_fridays, key=lambda x: abs(x[1] - target_dte))
+        logger.info(f"Selected expiration: {best[0]} ({best[1]} DTE)")
+        return best[0]
     
     def _fetch_option_greeks(self, symbol: str, expiration: date, strike: float, opt_type: str) -> Optional[Dict]:
         """Fetch Greeks for a single option."""

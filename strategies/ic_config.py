@@ -329,7 +329,7 @@ class StrikeConfig:
     """Strike selection configuration."""
     target_dte: int = 7
     min_dte: int = 5
-    max_dte: int = 10
+    max_dte: int = 14  # Increased to handle Monday entries (next Friday = 11 DTE)
     
     # Default wing widths
     default_wing_width: int = 5
